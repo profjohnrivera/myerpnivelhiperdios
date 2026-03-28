@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+@theme {
+  /* =========================================
+     🎨 1. PALETA DE COLORES ODOO 19 ENTERPRISE
+     ========================================= */
+     
+  /* Colores de Marca y Acción */
+  --color-odoo-primary: #714B67;
+  --color-odoo-primary-hover: #624159; /* Extraído de --os-primary-button-hover-bg */
+  --color-odoo-link: #017e84;
+  --color-odoo-link-hover: #01585c;
+  
+  /* Colores de Estado (Feedback) */
+  --color-odoo-success: #28a745;
+  --color-odoo-info: #17a2b8;
+  --color-odoo-warning: #e99d00;
+  --color-odoo-danger: #d44c59;
+  
+  /* Escala de Grises Estructural */
+  --color-odoo-bg: #F9FAFB;         /* --body-bg */
+  --color-odoo-hover: #e7e9ed;      /* --secondary-bg */
+  --color-odoo-border: #d8dadd;     /* --border-color */
+  --color-odoo-text-muted: #5f636f; /* --gray-600 */
+  --color-odoo-text-dark: #111827;  /* --body-color */
+
+  /* =========================================
+     ☁️ 2. SOMBRAS EXACTAS DE ODOO
+     ========================================= */
+  --shadow-odoo-sm: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+  --shadow-odoo-base: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
+  --shadow-odoo-lg: 0 1rem 3rem rgba(0, 0, 0, 0.175);
+
+  /* =========================================
+     🖋️ 3. TIPOGRAFÍA ODOO
+     ========================================= */
+  --font-odoo-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Ubuntu, "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+}
+
+/* =========================================
+   🏗️ RESET Y ESTRUCTURA BASE
+   ========================================= */
+@layer base {
+  html, body {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    
+    /* Inyección del ADN Tipográfico */
+    font-family: var(--font-odoo-sans);
+    font-size: 0.875rem; /* 14px exactos */
+    font-weight: 400;
+    line-height: 1.5;
+    
+    /* Inyección de Colores Base */
+    color: var(--color-odoo-text-dark);
+    background-color: var(--color-odoo-bg);
+    
+    /* Mejoras de Renderizado */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: rgba(0, 0, 0, 0);
+  }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+
+  /* Asegura que los inputs y textareas no usen la fuente del navegador */
+  input, textarea, select, button {
+    font-family: inherit;
+    font-size: inherit;
+    line-height: inherit;
+  }
+}
+
+/* =========================================
+   🛠️ CLASES DE UTILIDAD ESPECÍFICAS
+   ========================================= */
+@layer utilities {
+  
+  /* Sombra para el "Card" (Hoja del Formulario) y Botones */
+  .odoo-shadow {
+    box-shadow: var(--shadow-odoo-sm);
+  }
+  
+  /* Sombra para Menús Desplegables y Modales */
+  .odoo-dropdown-shadow {
+    box-shadow: var(--shadow-odoo-base);
+  }
+  
+  /* Anillo de Foco Turquesa (Inputs y Checkboxes) */
+  .odoo-focus-ring {
+    box-shadow: 0 0 0 0.25rem rgba(1, 126, 132, 0.5); /* 0.5 de opacidad oficial */
+    outline: none;
+  }
+  
+  /* Scrollbar Fino (Replicando el o-scrollbar-thin de Odoo) */
+  .odoo-scrollbar::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .odoo-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .odoo-scrollbar::-webkit-scrollbar-thumb {
+    background-color: #d8dadd; /* --gray-300 */
+    border-radius: 4px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  .odoo-scrollbar::-webkit-scrollbar-thumb:hover {
+    background-color: #9a9ca5; /* --gray-400 */
+  }
+}
