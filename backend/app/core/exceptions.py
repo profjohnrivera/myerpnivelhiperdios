@@ -1,8 +1,8 @@
 # backend/app/core/exceptions.py
 import traceback
-import logging
 from typing import Optional
 from app.core.env import Context
+
 
 class ERPException(Exception):
     """Base para todos los errores del ecosistema."""
@@ -11,15 +11,18 @@ class ERPException(Exception):
         self.code = code
         super().__init__(self.message)
 
+
 class SecurityError(ERPException):
     """Errores de RLS o permisos."""
     def __init__(self, message: str = "Acceso Denegado"):
         super().__init__(message, code="SECURITY_DENIED")
 
+
 class ValidationError(ERPException):
     """Errores de integridad de datos (@constrains)."""
     def __init__(self, message: str):
         super().__init__(message, code="VALIDATION_FAILED")
+
 
 class ExceptionHandler:
     """
@@ -31,24 +34,29 @@ class ExceptionHandler:
         env = Context.get_env()
         error_type = e.__class__.__name__
         full_trace = traceback.format_exc()
-        
-        # Log en consola con estilo
+
         print(f"\n🔥 [FORENSIC ERROR] {error_type} en {model_name or 'Kernel'}")
         print(f"📝 Mensaje: {str(e)}")
-        
-        # Si el sistema ya está arriba, guardamos en la tabla de auditoría
-        if env and model_name != 'ir.audit.log':
+
+        if env and model_name != "ir.audit.log":
             try:
-                AuditLog = env['ir.audit.log']
-                await AuditLog.create({
-                    'name': f"CRASH: {error_type}",
-                    'res_model': model_name or 'system',
-                    'old_value': 'OPERATIONAL',
-                    'new_value': 'CRASHED',
-                    'field_name': 'system_health',
-                    'message': f"{str(e)}\n\n{full_trace}"
-                })
-            except:
-                pass # Evitar bucle infinito si falla la auditoría
-        
-        return {"error": str(e), "code": getattr(e, 'code', 'UNKNOWN')}
+                AuditLog = env["ir.audit.log"]
+                payload = {
+                    "res_model": model_name or "system",
+                    "res_id": 0,
+                    "action": "error",
+                    "changes": {
+                        "error_type": error_type,
+                        "code": getattr(e, "code", "UNKNOWN"),
+                    },
+                    "message": f"{str(e)}\n\n{full_trace}",
+                }
+
+                if str(getattr(env, "uid", "")).isdigit():
+                    payload["user_id"] = int(env.uid)
+
+                await AuditLog.create(payload)
+            except Exception:
+                pass
+
+        return {"error": str(e), "code": getattr(e, "code", "UNKNOWN")}

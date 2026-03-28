@@ -1,82 +1,158 @@
 # backend/app/core/auditor.py
-from typing import Any
+from typing import Any, Dict, Optional
 from app.core.event_bus import EventBus
-from app.core.env import Context
-from app.core.registry import Registry
 from app.core.worker import WorkerEngine
-import json
+from app.core.env import Context
+
 
 class AuditService:
     """
     👁️ SERVICIO DE TRAZABILIDAD AUTOMÁTICA
     Escucha al EventBus y genera logs forenses sin bloquear el hilo principal.
     """
-    
+
+    _bootstrapped: bool = False
+
+    EXCLUDED_MODELS = {
+        "ir.audit.log",
+        "ir.queue",
+    }
+
     @classmethod
     async def bootstrap(cls):
+        if cls._bootstrapped:
+            return
+
         bus = EventBus()
-        # Escuchamos mutaciones de CUALQUIER modelo (*)
         bus.subscribe("*.created", cls.on_record_created)
         bus.subscribe("*.updated", cls.on_record_updated)
         bus.subscribe("*.unlinked", cls.on_record_unlinked)
+
+        cls._bootstrapped = True
         print("🕵️ Auditor Universal: Conectado y vigilando mutaciones.")
 
     @classmethod
-    async def on_record_created(cls, model_name: str, record: Any):
-        # Encolamos la tarea en el Worker para no ralentizar el 'create'
-        await WorkerEngine.enqueue(
-            model_name='ir.audit.log', 
-            method_name='create_log_task', 
-            kwargs={'model': model_name, 'res_id': record.id, 'method': 'create', 'values': None}
-        )
+    def _should_skip(cls, model_name: Optional[str]) -> bool:
+        if not model_name:
+            return True
 
-    @classmethod
-    async def on_record_updated(cls, model_name: str, record: Any, changes: dict, **kwargs):
-        # Solo auditamos si hay cambios reales
-        if not changes: return
-        
-        await WorkerEngine.enqueue(
-            model_name='ir.audit.log', 
-            method_name='create_log_task', 
-            kwargs={'model': model_name, 'res_id': record.id, 'method': 'create', 'values': None}
-        )
+        # Nunca auditar modelos autoreferenciales/técnicos de cola/log
+        if model_name in cls.EXCLUDED_MODELS:
+            return True
 
-    @classmethod
-    async def on_record_unlinked(cls, model_name: str, record_id: str):
-        await WorkerEngine.enqueue(
-            model_name='ir.audit.log', 
-            method_name='create_log_task', 
-            kwargs={'model': model_name, 'res_id': record.id, 'method': 'create', 'values': None}
-        )
+        # Nunca auditar modelos técnicos ir.*
+        if model_name.startswith("ir."):
+            return True
+
+        env = Context.get_env()
+
+        # No auditar bootstrap, system jobs o contextos explícitamente silenciados
+        if env:
+            if getattr(env, "su", False):
+                return True
+
+            if str(getattr(env, "uid", "")) == "system":
+                return True
+
+            if getattr(env, "context", {}).get("disable_audit"):
+                return True
+
+        return False
 
     @staticmethod
-    async def _create_log_task(model: str, res_id: str, method: str, values: dict = None):
-        """Esta función se ejecuta dentro del Worker (background)"""
-        env = Context.get_env()
-        try:
-            IrAuditLog = Registry.get_model('ir.audit.log')
-            
-            # Si es una actualización, registramos campo por campo
-            if method == 'write' and values:
-                for field, new_val in values.items():
-                    # Evitamos auditar campos técnicos de fecha/uid para no saturar
-                    if field in ['write_date', 'write_uid', 'write_version']: continue
-                    
-                    await IrAuditLog.create({
-                        'res_model': model,
-                        'res_id': res_id,
-                        'field_name': field,
-                        'new_value': str(new_val),
-                        'user_id': env.uid if env else 'system',
-                        'method': method
-                    })
-            else:
-                # Create o Unlink
-                await IrAuditLog.create({
-                    'res_model': model,
-                    'res_id': res_id,
-                    'user_id': env.uid if env else 'system',
-                    'method': method
-                })
-        except Exception as e:
-            print(f"⚠️ Error en Auditoría Background: {e}")
+    def _normalize_action(action: Optional[str]) -> str:
+        if action in ("created", "create"):
+            return "create"
+        if action in ("updated", "write"):
+            return "write"
+        if action in ("unlinked", "unlink"):
+            return "unlink"
+        if action == "error":
+            return "error"
+        return "write"
+
+    @classmethod
+    async def on_record_created(
+        cls,
+        model_name: str = None,
+        record: Any = None,
+        action: str = None,
+        **kwargs,
+    ):
+        if cls._should_skip(model_name):
+            return
+        if record is None:
+            return
+
+        res_id = int(record.id) if str(record.id).isdigit() else record.id
+
+        await WorkerEngine.enqueue(
+            model_name="ir.audit.log",
+            method_name="create_from_queue",
+            kwargs={
+                "res_model": model_name,
+                "res_id": res_id,
+                "action": cls._normalize_action(action or "create"),
+                "changes": None,
+                "message": None,
+            },
+        )
+
+    @classmethod
+    async def on_record_updated(
+        cls,
+        model_name: str = None,
+        record: Any = None,
+        changes: Dict = None,
+        action: str = None,
+        **kwargs,
+    ):
+        if cls._should_skip(model_name):
+            return
+        if record is None:
+            return
+
+        clean_changes = changes or {}
+        if not clean_changes:
+            return
+
+        res_id = int(record.id) if str(record.id).isdigit() else record.id
+
+        await WorkerEngine.enqueue(
+            model_name="ir.audit.log",
+            method_name="create_from_queue",
+            kwargs={
+                "res_model": model_name,
+                "res_id": res_id,
+                "action": cls._normalize_action(action or "write"),
+                "changes": clean_changes,
+                "message": None,
+            },
+        )
+
+    @classmethod
+    async def on_record_unlinked(
+        cls,
+        model_name: str = None,
+        record_id: Any = None,
+        action: str = None,
+        **kwargs,
+    ):
+        if cls._should_skip(model_name):
+            return
+        if record_id is None:
+            return
+
+        res_id = int(record_id) if str(record_id).isdigit() else record_id
+
+        await WorkerEngine.enqueue(
+            model_name="ir.audit.log",
+            method_name="create_from_queue",
+            kwargs={
+                "res_model": model_name,
+                "res_id": res_id,
+                "action": cls._normalize_action(action or "unlink"),
+                "changes": None,
+                "message": None,
+            },
+        )

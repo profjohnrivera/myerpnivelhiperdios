@@ -1,34 +1,57 @@
 # backend/modules/core_system/module.py
 from app.core.module import Module
-from .models import IrModel, IrModelFields, IrRule, IrSequence, IrAuditLog, IrModule, IrModuleDependency, IrModelData, IrActionsServer,IrUiMenu, IrModelAccess, IrUiView, IrConfigParameter
-from .handlers import on_sequence_created
-from .events import SequenceCreated
+
+from modules.core_system.models.ir_model import IrModel
+from modules.core_system.models.ir_model_fields import IrModelFields
+from modules.core_system.models.ir_sequence import IrSequence
+from modules.core_system.models.ir_rule import IrRule
+from modules.core_system.models.ir_audit import IrAuditLog
+from modules.core_system.models.ir_module import IrModule, IrModuleDependency
+from modules.core_system.models.ir_model_data import IrModelData
+from modules.core_system.models.ir_actions import IrActionActWindow, IrActionServer
+from modules.core_system.models.ir_ui_menu import IrUiMenu
+from modules.core_system.models.ir_model_access import IrModelAccess
+from modules.core_system.models.ir_ui_view import IrUiView
+from modules.core_system.models.ir_config_parameter import IrConfigParameter
+from modules.core_system.models.ir_queue import IrQueue
+
 
 class CoreSystemModule(Module):
     name = "core_system"
+    depends = ["core_base"]
+    icon = "settings"
+    label = "Ajustes"
 
     def register(self):
-        # 1. Presentamos los modelos al Registry
-        self.register_model(IrModel)
-        self.register_model(IrModelFields)
-        self.register_model(IrRule)
-        self.register_model(IrSequence)
-        self.register_model(IrAuditLog)
-        self.register_model(IrModule)
-        self.register_model(IrModuleDependency)
-        self.register_model(IrModelData)
-        self.register_model(IrActionsServer)
-        self.register_model(IrUiMenu)
-        self.register_model(IrModelAccess)
-        self.register_model(IrUiView)
-        self.register_model(IrConfigParameter)
+        self.publish_meta()
 
+        self.register_models(
+            IrModel,
+            IrModelFields,
+            IrSequence,
+            IrRule,
+            IrAuditLog,
+            IrModule,
+            IrModuleDependency,
+            IrModelData,
+            IrActionActWindow,
+            IrActionServer,
+            IrUiMenu,
+            IrModelAccess,
+            IrUiView,
+            IrConfigParameter,
+            IrQueue,
+        )
 
-        # 2. Metadatos de la Interfaz (SDUI)
-        self.bus.publish_meta(module="core_system", icon="settings", label="Ajustes")
-        self.bus.publish_menu(parent="core_system", action="sequence", label="Secuencias")
+    async def boot(self):
+        from app.core.event_bus import EventBus
 
-    def boot(self):
-        # 3. Suscripción a Eventos
-        self.bus.subscribe(SequenceCreated, on_sequence_created)
+        bus = EventBus()
+
+        try:
+            from modules.core_system.services.sequence_service import on_sequence_created
+            bus.subscribe("SequenceCreated", on_sequence_created)
+        except Exception:
+            pass
+
         print("💎 [CORE] Estructuras de control y seguridad inicializadas.")
