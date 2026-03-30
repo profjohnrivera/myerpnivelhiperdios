@@ -7,7 +7,7 @@ import pkgutil
 import traceback
 from typing import Any, Dict, List, Optional, Type
 
-from app.core.env import Env, Context
+from app.core.env import Env, env_scope
 from app.core.event_bus import EventBus
 from app.core.graph import Graph
 from app.core.orm import Model
@@ -19,14 +19,14 @@ class Kernel:
     """
     Constitución única del núcleo.
 
-    REGLA OFICIAL DE A6:
+    REGLA OFICIAL:
     - Kernel es la ÚNICA vía de carga de modules/*/data
-    - DataIngestor ya no ejecuta bootstrap real
-    - Todo init_* corre aquí, con Env de sistema y Context restaurado
+    - Todo init_* corre aquí con Env técnico scoped
+    - El bus oficial viene desde Application
     """
 
     def __init__(self, bus: Optional[EventBus] = None, graph: Optional[Graph] = None) -> None:
-        self.bus = bus or EventBus()
+        self.bus = bus or EventBus.get_instance()
         self.graph = graph or Graph()
 
         Model._graph = self.graph
@@ -52,7 +52,6 @@ class Kernel:
             mod_name = module_cls.name
             instance = module_cls(kernel=self)
 
-            # Importar models antes del register para que el módulo registre conscientemente
             self._import_optional_subpackage(mod_name, "models")
 
             self.modules[mod_name] = instance
@@ -62,9 +61,6 @@ class Kernel:
             print(f"   🔹 Registered: {mod_name}")
 
     async def prepare(self) -> None:
-        """
-        Registry cerrado, schema sincronizado y metadata técnica persistida.
-        """
         if self._prepared:
             return
 
@@ -72,7 +68,6 @@ class Kernel:
             raise RuntimeError("❌ No hay módulos cargados en el kernel.")
 
         self._ensure_foundational_models()
-
         Registry.freeze()
 
         from app.core.storage.postgres_storage import PostgresGraphStorage
@@ -88,9 +83,6 @@ class Kernel:
         self._prepared = True
 
     async def load_data(self) -> None:
-        """
-        Carga vistas e init data después de tener registry y schema consistentes.
-        """
         if not self._prepared:
             raise RuntimeError("❌ Kernel.prepare() debe ejecutarse antes de load_data().")
 
@@ -100,9 +92,6 @@ class Kernel:
             await self._execute_init_data(mod_name)
 
     async def boot(self) -> None:
-        """
-        Pone módulos online y luego despierta servicios.
-        """
         if self._booted:
             return
 
@@ -174,10 +163,6 @@ class Kernel:
                 )
 
     def _import_optional_subpackage(self, module_name: str, subpackage: str) -> bool:
-        """
-        Solo tolera el caso 'subpackage no existe'.
-        Si existe y falla, aborta.
-        """
         full_package_path = f"modules.{module_name}.{subpackage}"
 
         try:
@@ -203,11 +188,6 @@ class Kernel:
         return True
 
     def _ensure_foundational_models(self) -> None:
-        """
-        Garantiza que modelos base y técnicos existan en Registry
-        antes de freeze/sync/init_data.
-        """
-
         if "core_base" in self.modules:
             try:
                 from modules.core_base.models.res_partner import ResPartner
@@ -271,9 +251,6 @@ class Kernel:
                     Registry.register_model(model_cls, owner_module="core_system")
 
     async def _run_maybe_async(self, func, *args, **kwargs):
-        """
-        Ejecuta callables sync/async sin duplicar lógica.
-        """
         if asyncio.iscoroutinefunction(func):
             return await func(*args, **kwargs)
 
@@ -284,22 +261,18 @@ class Kernel:
 
     async def _execute_with_system_env(self, func, *args, **kwargs):
         """
-        Activa un Env técnico temporal y RESTAURA el Context al salir.
+        Activa un Env técnico temporal scoped y lo restaura al salir.
         """
-        env = Env(user_id="system", graph=self.graph)
-        token = Context.set_env(env)
-        try:
+        env = Env(
+            user_id="system",
+            graph=self.graph,
+            su=True,
+            _skip_autoset=True,
+        )
+        async with env_scope(env):
             return await self._run_maybe_async(func, env, *args, **kwargs)
-        finally:
-            Context.restore(token)
 
     async def _execute_init_data(self, module_name: str):
-        """
-        Pipeline oficial y único de carga de data de módulos.
-        Recorre modules.<mod>.data y ejecuta:
-        - submódulos *.py con funciones init_*
-        - opcionalmente init_data() en el package
-        """
         data_package_path = f"modules.{module_name}.data"
 
         try:
@@ -333,9 +306,6 @@ class Kernel:
         await self._execute_with_system_env(_runner)
 
     async def _sync_registry_metadata(self):
-        """
-        Ejecuta el sincronizador técnico oficial del registry si existe.
-        """
         try:
             sync_mod = importlib.import_module("modules.core_system.data.registry_sync")
             sync_func = getattr(sync_mod, "sync_models_and_fields", None)

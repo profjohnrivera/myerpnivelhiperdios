@@ -7,6 +7,7 @@ from typing import Type, Dict, List, Callable, Awaitable, Union, Any, Optional
 
 from app.core.events import Event
 from app.core.registry import Registry
+from app.core.payloads import normalize_payload
 
 EventHandler = Callable[[Any], Union[None, Awaitable[None]]]
 
@@ -91,13 +92,11 @@ class EventBus:
         handlers: List[EventHandler] = []
         seen = set()
 
-        # Coincidencia exacta
         for handler in self._subscribers.get(event_name, []):
             if id(handler) not in seen:
                 handlers.append(handler)
                 seen.add(id(handler))
 
-        # Wildcards
         for key, key_handlers in self._subscribers.items():
             if isinstance(key, str) and ("*" in key or "?" in key or "[" in key):
                 if fnmatch.fnmatch(event_name, key):
@@ -112,6 +111,19 @@ class EventBus:
     # PUBLICACIÓN
     # =========================================================================
 
+    @staticmethod
+    def _build_payload_snapshot(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Snapshot forense serializable del evento.
+        No reemplaza los objetos vivos; solo añade una vista segura.
+        """
+        snapshot = {}
+        for key, value in kwargs.items():
+            if key in {"record", "env", "graph"}:
+                continue
+            snapshot[key] = normalize_payload(value)
+        return snapshot
+
     async def publish(self, event: Union[Event, str], **kwargs) -> None:
         """
         Publica un evento y ejecuta handlers concurrentemente.
@@ -120,11 +132,18 @@ class EventBus:
         - Event object -> handlers reciben el objeto
         - String event  -> handlers reciben kwargs enriquecidos
         - Wildcards     -> "*.created", "*.updated", etc.
+
+        P2-B:
+        - añade payload_snapshot serializable para auditoría/forense
+        - preserva record/env/graph vivos para handlers de negocio
         """
         if isinstance(event, Event):
             event_key = type(event)
             handlers = list(self._subscribers.get(event_key, []))
-            payload_kwargs = kwargs
+            payload_kwargs = {
+                **kwargs,
+                "payload_snapshot": self._build_payload_snapshot(kwargs),
+            }
         else:
             event_key = str(event)
             handlers = self._get_string_handlers(event_key)
@@ -132,7 +151,6 @@ class EventBus:
             model_name = kwargs.get("model_name")
             action_name = kwargs.get("action")
 
-            # Enriquecimiento para eventos string estilo sale.order.updated
             if "." in event_key:
                 parts = event_key.split(".")
                 if len(parts) >= 2:
@@ -146,6 +164,12 @@ class EventBus:
                 "event_name": event_key,
                 "model_name": model_name,
                 "action": action_name,
+                "payload_snapshot": self._build_payload_snapshot({
+                    **kwargs,
+                    "event_name": event_key,
+                    "model_name": model_name,
+                    "action": action_name,
+                }),
             }
 
         if not handlers:

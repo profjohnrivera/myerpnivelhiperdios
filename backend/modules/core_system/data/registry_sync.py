@@ -11,14 +11,11 @@ async def sync_models_and_fields(env):
       - ir.model
       - ir.model.fields
 
-    Diseño definitivo:
-    - Idempotente
-    - No depende de reconsultar ir.model después de crear modelos
-    - Usa el grafo vivo actual
-    - Persiste al final en un solo save
-    - Compatible con IDs temporales del Graph y su remapeo final
+    P3-B:
+    - usa technical_fields, no schema_fields
+    - ir.model.fields representa catálogo técnico del modelo,
+      no solo columnas físicas
     """
-
     print("   🧠 [SYNC] Volcando Arquitectura del Registry a la Base de Datos...")
 
     IrModel = env["ir.model"]
@@ -34,7 +31,6 @@ async def sync_models_and_fields(env):
     campos_creados = 0
     campos_actualizados = 0
 
-    # Mapa en memoria: modelo técnico -> record de ir.model
     model_records = {}
 
     # =========================================================
@@ -76,7 +72,7 @@ async def sync_models_and_fields(env):
         model_records[tech_name] = rec
 
     # =========================================================
-    # FASE 2: SINCRONIZAR CAMPOS
+    # FASE 2: SINCRONIZAR CAMPOS TÉCNICOS
     # =========================================================
     for tech_name, model_class in models_dict.items():
         model_rec = model_records.get(tech_name)
@@ -85,7 +81,7 @@ async def sync_models_and_fields(env):
             continue
 
         model_id = model_rec.id
-        fields_meta = Registry.get_fields_for_model(tech_name) or {}
+        fields_meta = Registry.get_technical_fields_for_model(tech_name) or {}
 
         for field_name, meta in fields_meta.items():
             label = meta.get("label") or meta.get("string") or field_name

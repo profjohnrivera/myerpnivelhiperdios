@@ -1,19 +1,22 @@
 # backend/modules/mod_sales/models/sale_order_line.py
 
+from typing import Dict, Any
+
 from app.core.orm import Field, SelectionField, RelationField, compute, onchange
 from app.core.abstract_models import AbstractDocumentLine
 from app.core.registry import Registry
+
+from modules.mod_sales.services import SaleOrderService
 
 
 class SaleOrderLine(AbstractDocumentLine):
     """
     Línea de pedido de venta.
 
-    Enfoque endurecido:
-    - sin SQL directo en lógica de negocio
-    - ORM/Registry como fuente de verdad
-    - cálculos consistentes y seguros
-    - sin romper el flujo actual que ya funciona
+    P1-A:
+    - la línea mantiene sincronizado el agregado del pedido padre
+      dentro del dominio/graph
+    - ya no dependemos de SQL correctivo en data_write.py
     """
     _name = "sale.order.line"
     _rec_name = "name"
@@ -45,6 +48,7 @@ class SaleOrderLine(AbstractDocumentLine):
     # =========================================================================
     # HELPERS
     # =========================================================================
+
     @staticmethod
     async def _get_product_record(product_value):
         if not product_value:
@@ -95,6 +99,7 @@ class SaleOrderLine(AbstractDocumentLine):
     # =========================================================================
     # ONCHANGE
     # =========================================================================
+
     @onchange("product_id")
     async def _onchange_product_id(self):
         if not getattr(self, "product_id", None):
@@ -121,6 +126,7 @@ class SaleOrderLine(AbstractDocumentLine):
     # =========================================================================
     # COMPUTES
     # =========================================================================
+
     @compute(depends=["product_uom_qty", "price_unit", "display_type"])
     def _compute_subtotal(self):
         self._recompute_subtotal_now()
@@ -165,3 +171,81 @@ class SaleOrderLine(AbstractDocumentLine):
             self.invoice_status = "upselling"
         else:
             self.invoice_status = "no"
+
+    # =========================================================================
+    # CRUD SINCRONIZANDO EL PADRE
+    # =========================================================================
+
+    @classmethod
+    async def create(cls, vals: Dict[str, Any], context=None):
+        record = await super().create(vals, context=context)
+
+        try:
+            await SaleOrderService.sync_order_aggregates_for_line(record, removing=False)
+        except Exception as e:
+            print(f"⚠️ [SALE ORDER LINE] No se pudo sincronizar pedido padre tras create: {e}")
+
+        return record
+
+    async def write(self, vals: Dict[str, Any]) -> bool:
+        old_order = getattr(self, "order_id", None)
+        old_order_id = old_order.id if hasattr(old_order, "id") else old_order
+
+        result = await super().write(vals)
+
+        try:
+            new_order = getattr(self, "order_id", None)
+            new_order_id = new_order.id if hasattr(new_order, "id") else new_order
+
+            # Mismo pedido -> reemplazar línea viva en el agregado
+            if old_order_id and new_order_id and str(old_order_id) == str(new_order_id):
+                await SaleOrderService.sync_order_aggregates_for_line(
+                    self,
+                    removing=False,
+                    explicit_order=new_order,
+                )
+            else:
+                # Recalcular el pedido anterior si la línea se movió
+                if old_order_id and str(old_order_id).isdigit():
+                    OrderModel = Registry.get_model("sale.order")
+                    if OrderModel:
+                        old_order_rec = OrderModel(_id=int(old_order_id), context=self.graph, env=self._env)
+                        await SaleOrderService.sync_order_aggregates_for_line(
+                            self,
+                            removing=True,
+                            explicit_order=old_order_rec,
+                        )
+
+                # Recalcular el nuevo pedido
+                if new_order_id:
+                    await SaleOrderService.sync_order_aggregates_for_line(
+                        self,
+                        removing=False,
+                        explicit_order=new_order,
+                    )
+
+        except Exception as e:
+            print(f"⚠️ [SALE ORDER LINE] No se pudo sincronizar pedido padre tras write: {e}")
+
+        return result
+
+    async def unlink(self) -> bool:
+        old_order = getattr(self, "order_id", None)
+        old_order_id = old_order.id if hasattr(old_order, "id") else old_order
+
+        result = await super().unlink()
+
+        try:
+            if old_order_id and str(old_order_id).isdigit():
+                OrderModel = Registry.get_model("sale.order")
+                if OrderModel:
+                    old_order_rec = OrderModel(_id=int(old_order_id), context=self.graph, env=self._env)
+                    await SaleOrderService.sync_order_aggregates_for_line(
+                        self,
+                        removing=True,
+                        explicit_order=old_order_rec,
+                    )
+        except Exception as e:
+            print(f"⚠️ [SALE ORDER LINE] No se pudo sincronizar pedido padre tras unlink: {e}")
+
+        return result

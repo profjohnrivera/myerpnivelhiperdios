@@ -7,20 +7,121 @@ from app.core.module_discovery import discover_modules
 from app.core.env import Env
 
 
+async def _save_and_resolve(app, *records):
+    """
+    Persiste el graph y devuelve una lista de IDs reales alineada con los records.
+    """
+    id_map = await app.storage.save(app.graph)
+    resolved = []
+    for record in records:
+        real_id = id_map.get(str(record.id), record.id)
+        resolved.append(real_id)
+    return resolved
+
+
+async def _get_or_create_company(env_system, app):
+    """
+    Garantiza que exista la compañía base.
+    """
+    Company = env_system["res.company"]
+    companies = await Company.search([], limit=1)
+
+    if companies:
+        return companies[0].id
+
+    new_company = await Company.create({"name": "HiperDios Corp"})
+    [company_id] = await _save_and_resolve(app, new_company)
+    return company_id
+
+
+async def _get_or_create_group(env_system, app, name: str, description: str = "", is_system_admin: bool = False):
+    """
+    Garantiza grupos consistentes con la constitución nueva:
+    - admin real = is_system_admin=True
+    - grupos normales = is_system_admin=False
+    """
+    ResGroups = env_system["res.groups"]
+
+    groups = await ResGroups.search([("name", "=", name)], limit=1)
+    if groups:
+        group = groups[0]
+        await group.write({
+            "description": description,
+            "is_system_admin": is_system_admin,
+        })
+        await app.storage.save(app.graph)
+        return group.id
+
+    group = await ResGroups.create({
+        "name": name,
+        "description": description,
+        "is_system_admin": is_system_admin,
+    })
+    [group_id] = await _save_and_resolve(app, group)
+    return group_id
+
+
+async def _get_or_create_user(
+    env_system,
+    app,
+    *,
+    login: str,
+    name: str,
+    password: str,
+    company_id: int,
+    group_ids: list[int],
+):
+    """
+    Crea o actualiza un usuario demo.
+    """
+    UserModel = env_system["res.users"]
+
+    users = await UserModel.search([("login", "=", login)], limit=1)
+    if users:
+        user = users[0]
+        await user.write({
+            "name": name,
+            "password": password,
+            "company_id": company_id,
+            "group_ids": group_ids,
+            "active": True,
+        })
+        await app.storage.save(app.graph)
+        return user.id
+
+    user = await UserModel.create({
+        "name": name,
+        "login": login,
+        "password": password,
+        "group_ids": group_ids,
+        "company_id": company_id,
+        "active": True,
+    })
+    [user_id] = await _save_and_resolve(app, user)
+    return user_id
+
+
 async def reset_db():
-    print("🔌 Iniciando Protocolo de Reseteo (Multi-Usuario + RBAC)...")
+    print("🔌 Iniciando Protocolo de Reseteo Constitucional...")
 
     app = Application()
     pool = await app.storage.get_pool()
 
-    # 🧹 Limpieza nuclear de la base de datos
+    # ==========================================================
+    # 🧹 LIMPIEZA NUCLEAR
+    # ==========================================================
     async with pool.acquire() as conn:
         await conn.execute("DROP SCHEMA public CASCADE;")
         await conn.execute("CREATE SCHEMA public;")
         await conn.execute("GRANT ALL ON SCHEMA public TO postgres;")
         await conn.execute("GRANT ALL ON SCHEMA public TO public;")
 
+    # ==========================================================
     # 💎 BOOT CONSTITUCIONAL ÚNICO
+    # - prepare()
+    # - load_data()  -> aquí viven security.py, menus.py, demo.py
+    # - boot()
+    # ==========================================================
     modules = discover_modules("modules")
     await app.boot(modules)
 
@@ -35,208 +136,120 @@ async def reset_db():
     # ==========================================================
     # 🏢 FASE 0: COMPAÑÍA BASE
     # ==========================================================
-    Company = env_system["res.company"]
-    companies = await Company.search([], limit=1)
-    if companies:
-        company_id = companies[0].id
-    else:
-        new_company = await Company.create({"name": "HiperDios Corp"})
-        id_map = await app.storage.save(app.graph)
-        company_id = id_map.get(str(new_company.id), new_company.id)
+    print("\n--- 🏢 Asegurando Compañía Base ---")
+    company_id = await _get_or_create_company(env_system, app)
 
     # ==========================================================
-    # 🎭 FASE 1: CREACIÓN DE ROLES Y MATRIZ DE ACCESO (RBAC)
+    # 🎭 FASE 1: GRUPOS CONSTITUCIONALES
+    # ----------------------------------------------------------
+    # IMPORTANTE:
+    # Ya NO duplicamos ACL/RLS aquí.
+    # La seguridad global vive en:
+    #   modules/core_system/data/security.py
+    #
+    # Aquí solo garantizamos que los grupos demo estén coherentes.
     # ==========================================================
-    print("\n--- 🎭 Forjando Matriz de Accesos (RBAC) ---")
+    print("\n--- 🎭 Asegurando Grupos Constitucionales ---")
+
+    r_admin_id = await _get_or_create_group(
+        env_system,
+        app,
+        name="Administración / Ajustes",
+        description="Acceso total al sistema. Bypass de ACL y RLS.",
+        is_system_admin=True,
+    )
+
+    r_ventas_id = await _get_or_create_group(
+        env_system,
+        app,
+        name="Ventas / Usuario",
+        description="Grupo base de usuarios autenticados.",
+        is_system_admin=False,
+    )
+
+    r_gerencia_id = await _get_or_create_group(
+        env_system,
+        app,
+        name="Ventas / Gerencia",
+        description="Perfil gerencial del módulo de ventas.",
+        is_system_admin=False,
+    )
+
+    # ==========================================================
+    # 👥 FASE 2: USUARIOS DEMO
+    # ----------------------------------------------------------
+    # Admin:
+    #   - grupo admin técnico real
+    #   - también pertenece al grupo base para compatibilidad de menús/ACL
+    #
+    # Alpha:
+    #   - vendedor operativo
+    #
+    # Beta:
+    #   - gerencia + base
+    # ==========================================================
+    print("\n--- 👥 Asegurando Usuarios Demo ---")
+
+    admin_id = await _get_or_create_user(
+        env_system,
+        app,
+        login="admin",
+        name="Mitchell Admin",
+        password="admin",
+        company_id=company_id,
+        group_ids=[r_admin_id, r_ventas_id],
+    )
+
+    alpha_id = await _get_or_create_user(
+        env_system,
+        app,
+        login="alpha",
+        name="Vendedor Alpha",
+        password="admin",
+        company_id=company_id,
+        group_ids=[r_ventas_id],
+    )
+
+    beta_id = await _get_or_create_user(
+        env_system,
+        app,
+        login="beta",
+        name="Gerente Beta",
+        password="admin",
+        company_id=company_id,
+        group_ids=[r_gerencia_id, r_ventas_id],
+    )
+
+    # ==========================================================
+    # 🧪 FASE 3: VALIDACIÓN RÁPIDA DE COHERENCIA
+    # ==========================================================
+    print("\n--- 🧪 Validando Coherencia de Seguridad ---")
+
     ResGroups = env_system["res.groups"]
-    IrModel = env_system["ir.model"]
-    IrModelAccess = env_system["ir.model.access"]
+    admin_groups = await ResGroups.search([
+        ("name", "=", "Administración / Ajustes")
+    ], limit=1)
 
-    role_admin = await ResGroups.create({"name": "Administración / Ajustes"})
-    role_ventas = await ResGroups.create({"name": "Ventas / Operativo"})
-    role_gerencia = await ResGroups.create({"name": "Ventas / Gerencia"})
+    if admin_groups:
+        admin_group = admin_groups[0]
+        try:
+            is_admin_flag = bool(getattr(admin_group, "is_system_admin", False))
+            print(f"   ✅ Grupo admin técnico: {admin_group.id} | is_system_admin={is_admin_flag}")
+        except Exception:
+            print("   ⚠️ No se pudo leer el flag is_system_admin del grupo admin.")
 
-    id_map = await app.storage.save(app.graph)
-    r_admin_id = id_map.get(str(role_admin.id), role_admin.id)
-    r_ventas_id = id_map.get(str(role_ventas.id), role_ventas.id)
-    r_gerencia_id = id_map.get(str(role_gerencia.id), role_gerencia.id)
+    print("\n==========================================================")
+    print("✅ RESET CONSTITUCIONAL COMPLETADO")
+    print("----------------------------------------------------------")
+    print(f"🏢 Company ID: {company_id}")
+    print(f"👤 Admin ID:   {admin_id}   | login=admin | password=admin")
+    print(f"👤 Alpha ID:   {alpha_id}   | login=alpha | password=admin")
+    print(f"👤 Beta ID:    {beta_id}    | login=beta  | password=admin")
+    print("==========================================================\n")
 
-    sale_models = await IrModel.search([("model", "=", "sale.order")], limit=1)
-    sale_line_models = await IrModel.search([("model", "=", "sale.order.line")], limit=1)
-    partner_models = await IrModel.search([("model", "=", "res.partner")], limit=1)
-
-    sale_model_id = sale_models[0].id if sale_models else None
-    sale_line_model_id = sale_line_models[0].id if sale_line_models else None
-    partner_model_id = partner_models[0].id if partner_models else None
-
-    # Vendedores
-    if sale_model_id:
-        await IrModelAccess.create({
-            "name": "Vendedores - Ventas",
-            "model_id": sale_model_id,
-            "group_id": r_ventas_id,
-            "perm_read": True,
-            "perm_write": True,
-            "perm_create": True,
-            "perm_unlink": False,
-        })
-
-    if sale_line_model_id:
-        await IrModelAccess.create({
-            "name": "Vendedores - Líneas de Venta",
-            "model_id": sale_line_model_id,
-            "group_id": r_ventas_id,
-            "perm_read": True,
-            "perm_write": True,
-            "perm_create": True,
-            "perm_unlink": False,
-        })
-
-    if partner_model_id:
-        await IrModelAccess.create({
-            "name": "Vendedores - Clientes",
-            "model_id": partner_model_id,
-            "group_id": r_ventas_id,
-            "perm_read": True,
-            "perm_write": False,
-            "perm_create": False,
-            "perm_unlink": False,
-        })
-
-    # Gerencia
-    if sale_model_id:
-        await IrModelAccess.create({
-            "name": "Gerencia - Ventas Totales",
-            "model_id": sale_model_id,
-            "group_id": r_gerencia_id,
-            "perm_read": True,
-            "perm_write": True,
-            "perm_create": True,
-            "perm_unlink": True,
-        })
-
-    if sale_line_model_id:
-        await IrModelAccess.create({
-            "name": "Gerencia - Líneas de Venta",
-            "model_id": sale_line_model_id,
-            "group_id": r_gerencia_id,
-            "perm_read": True,
-            "perm_write": True,
-            "perm_create": True,
-            "perm_unlink": True,
-        })
-
-    # Admin full
-    all_models = await IrModel.search([])
-    for m in all_models:
-        await IrModelAccess.create({
-            "name": f"Admin - {m.model}",
-            "model_id": m.id,
-            "group_id": r_admin_id,
-            "perm_read": True,
-            "perm_write": True,
-            "perm_create": True,
-            "perm_unlink": True,
-        })
-
-    await app.storage.save(app.graph)
-
-    # ==========================================================
-    # 👥 FASE 2: USUARIOS
-    # ==========================================================
-    print("\n--- 👥 Asignando Gafetes de Seguridad ---")
-    UserModel = env_system["res.users"]
-
-    admin = await UserModel.create({
-        "name": "Mitchell Admin",
-        "login": "admin",
-        "password": "admin",
-        "group_ids": [r_admin_id],
-        "company_id": company_id,
-    })
-    alpha = await UserModel.create({
-        "name": "Vendedor Alpha",
-        "login": "alpha",
-        "password": "admin",
-        "group_ids": [r_ventas_id],
-        "company_id": company_id,
-    })
-    beta = await UserModel.create({
-        "name": "Gerente Beta",
-        "login": "beta",
-        "password": "admin",
-        "group_ids": [r_gerencia_id],
-        "company_id": company_id,
-    })
-
-    id_map = await app.storage.save(app.graph)
-    alpha_id = id_map.get(str(alpha.id), alpha.id)
-    beta_id = id_map.get(str(beta.id), beta.id)
-
-    # ==========================================================
-    # 🛡️ FASE 3: PRIVACIDAD DE DATOS (RLS)
-    # ==========================================================
-    print("\n--- 🛡️ Creando Privacidad de Filas (RLS) ---")
-    IrRule = env_system["ir.rule"]
-
-    # Pedido: cada vendedor ve sus propios pedidos
-    await IrRule.create({
-        "name": "Privacidad de Ventas (Solo mis pedidos)",
-        "model_name": "sale.order",
-        "domain_force": '[["create_uid", "=", "{user_id}"]]',
-    })
-
-    # Línea: cada vendedor ve las líneas de pedidos creados por él
-    await IrRule.create({
-        "name": "Privacidad de Líneas de Venta (Solo líneas de mis pedidos)",
-        "model_name": "sale.order.line",
-        "domain_force": '[["order_id.create_uid", "=", "{user_id}"]]',
-    })
-
-    await app.storage.save(app.graph)
-
-    # ==========================================================
-    # 🛒 FASE 4: SIMULACIÓN DE TRABAJO
-    # ==========================================================
-    print("\n--- 🛒 Simulando operaciones de la empresa ---")
-    Partner = env_system["res.partner"]
-    cliente1 = await Partner.create({"name": "Corporación Stark"})
-
-    id_map = await app.storage.save(app.graph)
-    c1_id = id_map.get(str(cliente1.id), cliente1.id)
-
-    env_alpha = Env(
-        user_id=alpha_id,
-        graph=app.graph,
-        context={"company_id": company_id},
-    )
-    await env_alpha["sale.order"].create({
-        "partner_id": c1_id,
-        "company_id": company_id,
-    })
-    print("      ✅ [Alpha] Pedido creado exitosamente.")
-
-    env_beta = Env(
-        user_id=beta_id,
-        graph=app.graph,
-        context={"company_id": company_id},
-    )
-    await env_beta["sale.order"].create({
-        "partner_id": c1_id,
-        "company_id": company_id,
-    })
-    print("      ✅ [Beta] Pedido creado exitosamente.")
-
-    await app.storage.save(app.graph)
-
-    print("✅ ¡Arquitectura de BIGSERIAL Completa! RLS + RBAC Operativos y Tipados.")
-
-    # 🔌 Apagado limpio
+    # Apagado limpio del kernel/app
     await app.shutdown()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(reset_db())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(reset_db())

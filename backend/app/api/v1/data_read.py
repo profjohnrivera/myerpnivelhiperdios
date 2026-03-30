@@ -21,7 +21,7 @@ async def default_get(model_name: str, current_user_id: int = Depends(get_curren
     try:
         async with request_env(current_user_id) as (env, session_graph):
             ModelClass = Registry.get_model(model_name)
-            virtual_record = ModelClass(context=session_graph)
+            virtual_record = ModelClass(context=session_graph, env=env)
             return await _serialize_record(env, virtual_record, model_name)
     except Exception as e:
         traceback.print_exc()
@@ -58,14 +58,6 @@ async def search_data(
             order_by = payload.get("order_by", None)
             fields = payload.get("fields", None)
 
-            if not fields:
-                model_cls = Registry.get_model(model_name)
-                fields = [
-                    fname for fname in dir(model_cls)
-                    if hasattr(getattr(model_cls, fname, None), "get_meta")
-                    and getattr(model_cls, fname).get_meta().get("type") != "one2many"
-                ]
-
             records = await env[model_name].search(
                 domain=domain,
                 limit=limit,
@@ -78,11 +70,16 @@ async def search_data(
                 total = offset + len(records)
             else:
                 storage = PostgresGraphStorage()
-                all_ids = await storage.search_domain(model_name, domain)
+                all_ids = await storage.search_domain(
+                    model_name,
+                    domain,
+                    check_access=True,
+                )
                 total = len(all_ids)
 
             async def generate_json_stream():
                 yield f'{{"total": {total}, "data": ['
+
                 chunk_size = 500
                 first = True
 
@@ -99,7 +96,9 @@ async def search_data(
                 yield "]}"
 
             return StreamingResponse(generate_json_stream(), media_type="application/json")
+
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -114,6 +113,12 @@ async def read_record(
             records = env[model_name].browse([record_id], context=session_graph)
             if not records:
                 raise HTTPException(status_code=404, detail="No encontrado")
+
+            await records.load_data()
             return await _serialize_record(env, records[0], model_name)
+
+    except HTTPException:
+        raise
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))

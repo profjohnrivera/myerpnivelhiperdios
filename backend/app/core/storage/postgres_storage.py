@@ -5,6 +5,7 @@ import re
 import json
 import asyncpg
 import datetime
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from app.core.graph import Graph
@@ -15,24 +16,18 @@ class PostgresGraphStorage:
     """
     🏗️ ALMACENAMIENTO MATERIALIZADO (Nivel HiperDios)
 
-    Objetivos de esta versión:
-    - Mantener compatibilidad con lo que ya funciona
-    - Sacar la infraestructura a variables de entorno (con mismos defaults actuales)
-    - Endurecer persistencia y schema sin introducir migraciones destructivas
-    - Mantener LISTEN/NOTIFY, BIGSERIAL, M2M y búsquedas compiladas
+    CIERRE P2-A + P3-B:
+    - get_connection() SIEMPRE devuelve un objeto conexión-like
+    - nunca devuelve el Pool crudo
+    - para operaciones que necesitan conexión física estable, usar acquire_connection()
+    - este storage consume schema_fields, no runtime ni technical
     """
     _conn_pool: Optional[asyncpg.Pool] = None
     _ormcache_listener_conn: Optional[asyncpg.Connection] = None
     _worker_listener_conn: Optional[asyncpg.Connection] = None
 
-    # =========================================================================
-    # 0. CONFIG / INFRA
-    # =========================================================================
     @classmethod
     def _db_config(cls) -> Dict[str, Any]:
-        """
-        Defaults conservadores: preservan tu entorno actual si no defines variables.
-        """
         return {
             "user": os.getenv("ERP_DB_USER", "postgres"),
             "password": os.getenv("ERP_DB_PASSWORD", "1234"),
@@ -45,9 +40,6 @@ class PostgresGraphStorage:
 
     @staticmethod
     def _safe_ident(name: str) -> str:
-        """
-        Blindaje básico para nombres SQL generados por el motor.
-        """
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError(f"Identificador SQL inválido: {name!r}")
         return name
@@ -95,10 +87,6 @@ class PostgresGraphStorage:
 
     @classmethod
     async def start_worker_listener(cls, callback):
-        """
-        👂 DEMONIO DE COLA EVENT-DRIVEN
-        Mantiene una conexión dedicada para despertar al Worker.
-        """
         try:
             if not cls._worker_listener_conn:
                 cfg = cls._db_config()
@@ -116,22 +104,42 @@ class PostgresGraphStorage:
             print(f"   ⚠️ No se pudo iniciar el listener del worker: {e}")
 
     async def get_connection(self):
-        from app.core.transaction import transaction_conn
+        """
+        Contrato único:
+        - si hay transacción activa -> proxy transaccional actual
+        - si no hay transacción -> proxy no transaccional conexión-like
+        """
+        from app.core.transaction import get_current_conn, PooledConnectionProxy
 
-        conn = transaction_conn.get()
-        if conn:
-            return conn
+        current = get_current_conn()
+        if current is not None:
+            return current
 
         pool = await self.get_pool()
-        return pool
+        return PooledConnectionProxy(pool)
+
+    @asynccontextmanager
+    async def acquire_connection(self):
+        """
+        Cuando se necesita una conexión física estable:
+        - dentro de transacción, reusa el proxy actual
+        - fuera de transacción, adquiere una conexión real del pool
+        """
+        from app.core.transaction import get_current_conn
+
+        current = get_current_conn()
+        if current is not None:
+            yield current
+            return
+
+        pool = await self.get_pool()
+        async with pool.acquire() as conn:
+            yield conn
 
     async def init_db(self):
         await self.get_pool()
         await self.sync_schema()
 
-    # =========================================================================
-    # 1. PARSING / NORMALIZACIÓN
-    # =========================================================================
     def _parse_db_value(self, value: Any) -> Any:
         if isinstance(value, datetime.datetime):
             return value.isoformat()
@@ -167,9 +175,6 @@ class PostgresGraphStorage:
             "many2one": "BIGINT",
         }.get(internal_type, "TEXT")
 
-    # =========================================================================
-    # 2. MOTOR DE BÚSQUEDA COMPILADO (AST -> SQL)
-    # =========================================================================
     async def search_domain(
         self,
         model: str,
@@ -179,9 +184,7 @@ class PostgresGraphStorage:
         order_by: str = None,
         check_access: bool = True,
     ) -> List[int]:
-        conn_or_pool = await self.get_connection()
         table_name = self._safe_ident(model.replace(".", "_"))
-
         final_domain = list(domain) if domain else []
 
         if check_access:
@@ -209,7 +212,7 @@ class PostgresGraphStorage:
         order_str = ""
         if order_by:
             safe_parts = []
-            fields_config = Registry.get_fields_for_model(model)
+            fields_config = Registry.get_schema_fields_for_model(model)
 
             for part in order_by.split(","):
                 part = part.strip()
@@ -234,12 +237,8 @@ class PostgresGraphStorage:
         query = f'SELECT t0.id FROM "{table_name}" t0 {joins_sql} {where_str} {order_str} {limit_str} {offset_str}'.strip()
 
         try:
-            if isinstance(conn_or_pool, asyncpg.Pool):
-                async with conn_or_pool.acquire() as conn:
-                    rows = await conn.fetch(query, *params)
-            else:
-                rows = await conn_or_pool.fetch(query, *params)
-
+            async with self.acquire_connection() as conn:
+                rows = await conn.fetch(query, *params)
             return [r["id"] for r in rows]
         except Exception as e:
             print(f"🔥 Error en Compilación SQL ({table_name}): {e}\nQuery: {query}")
@@ -248,28 +247,8 @@ class PostgresGraphStorage:
     async def get_all_ids(self, model: str) -> List[int]:
         return await self.search_domain(model, [])
 
-    # =========================================================================
-    # 3. CARGA COMPLETA DEL GRAFO
-    # =========================================================================
     async def load(self) -> Graph:
-        """
-        Retorna un Graph vacío.
-
-        ARQUITECTURA DEFINITIVA:
-        El master Graph NO pre-carga todos los registros al boot.
-        Los registros se cargan on-demand via load_data() por request.
-
-        Por qué: SELECT * de todas las tablas al boot escala O(n_records).
-        Con 100k pedidos × 10 campos = 1M nodos en RAM antes del primer
-        request. Con LRUCache(100000) empieza a desalojar inmediatamente.
-        El boot tardaría minutos en producción.
-
-        El mecanismo correcto es el lazy loader (load_context) que ya existe
-        y que cada session graph usa via clone_for_session() + ChainMap.
-        Los registros se cargan cuando se necesitan, no al arrancar.
-        """
         return Graph()
-
 
     async def load_context(self, key_prefix: str) -> Dict[str, Any]:
         if not key_prefix.startswith("data:"):
@@ -280,17 +259,13 @@ class PostgresGraphStorage:
             return {}
 
         model_name, rec_id = parts[1], parts[2]
-        conn_or_pool = await self.get_connection()
 
-        if isinstance(conn_or_pool, asyncpg.Pool):
-            async with conn_or_pool.acquire() as conn:
-                return await self._execute_load_context(conn, model_name, rec_id)
-        else:
-            return await self._execute_load_context(conn_or_pool, model_name, rec_id)
+        async with self.acquire_connection() as conn:
+            return await self._execute_load_context(conn, model_name, rec_id)
 
     async def _execute_load_context(self, conn, model_name, rec_id):
         table_name = self._safe_ident(model_name.replace(".", "_"))
-        fields_cfg = Registry.get_fields_for_model(model_name)
+        fields_cfg = Registry.get_schema_fields_for_model(model_name)
 
         db_id = int(rec_id) if str(rec_id).isdigit() else rec_id
 
@@ -328,23 +303,15 @@ class PostgresGraphStorage:
         except Exception:
             return {}
 
-    # =========================================================================
-    # 4. ESQUEMA DINÁMICO (DDL) CON BIGSERIAL
-    # =========================================================================
     async def sync_schema(self):
-        conn_or_pool = await self.get_connection()
         models = Registry.get_all_models()
-
-        if isinstance(conn_or_pool, asyncpg.Pool):
-            async with conn_or_pool.acquire() as conn:
-                await self._execute_sync_schema(conn, models)
-        else:
-            await self._execute_sync_schema(conn_or_pool, models)
+        async with self.acquire_connection() as conn:
+            await self._execute_sync_schema(conn, models)
 
     async def _execute_sync_schema(self, conn, models):
         for tech_name, model_cls in models.items():
             table_name = self._safe_ident(tech_name.replace(".", "_"))
-            fields = Registry.get_fields_for_model(tech_name)
+            fields = Registry.get_schema_fields_for_model(tech_name)
 
             await conn.execute(
                 f'CREATE TABLE IF NOT EXISTS "{table_name}" ('
@@ -384,7 +351,7 @@ class PostgresGraphStorage:
                     await conn.execute(
                         f'CREATE INDEX IF NOT EXISTS "idx_{rel_table}_rel_id" ON "{rel_table}"("rel_id")'
                     )
-                    # FK reales para la tabla relacional
+
                     if target_model_m2m:
                         target_table_m2m = self._safe_ident(target_model_m2m.replace(".", "_"))
                         for col, ref_tbl in [("base_id", table_name), ("rel_id", target_table_m2m)]:
@@ -415,13 +382,9 @@ class PostgresGraphStorage:
                 except Exception:
                     pass
 
-        # ── SEGUNDA PASADA: Foreign Keys reales ──────────────────────────────
-        # Se hace DESPUÉS de crear todas las tablas para evitar que el FK
-        # falle porque la tabla referenciada aún no existe.
-        # ON DELETE CASCADE/SET NULL según el ondelete del campo en Python.
         for tech_name, model_cls in models.items():
             table_name = self._safe_ident(tech_name.replace(".", "_"))
-            fields = Registry.get_fields_for_model(tech_name)
+            fields = Registry.get_schema_fields_for_model(tech_name)
 
             for field_name, meta in fields.items():
                 f_type = meta.get("type", "string")
@@ -434,7 +397,6 @@ class PostgresGraphStorage:
 
                 target_table = self._safe_ident(target_model.replace(".", "_"))
                 ondelete = meta.get("ondelete", "set null").upper().replace(" ", "_")
-                # Normalizar: solo CASCADE y SET NULL son estándar aquí
                 if ondelete not in ("CASCADE", "SET_NULL", "RESTRICT", "SET NULL"):
                     ondelete = "SET NULL"
                 ondelete = ondelete.replace("_", " ")
@@ -442,7 +404,7 @@ class PostgresGraphStorage:
                 safe_field = self._safe_ident(field_name)
                 fk_name = self._safe_ident(
                     f"fk_{table_name}_{field_name}_{target_table}"
-                )[:63]  # PostgreSQL identifier limit
+                )[:63]
 
                 try:
                     await conn.execute(f"""
@@ -454,12 +416,8 @@ class PostgresGraphStorage:
                         DEFERRABLE INITIALLY DEFERRED
                     """)
                 except Exception:
-                    # FK already exists or table/column not ready — skip silently
                     pass
 
-    # =========================================================================
-    # 5. PERSISTENCIA ATÓMICA Y AUTO-RESOLUTOR TOPOLÓGICO
-    # =========================================================================
     async def save(self, graph: Graph, model_filter: Optional[str] = None) -> Dict[str, int]:
         all_dirty = graph.get_dirty_items()
         if not all_dirty:
@@ -486,15 +444,17 @@ class PostgresGraphStorage:
         if not changes:
             return {}
 
-        conn_or_pool = await self.get_connection()
-        id_mapping = {}
+        from app.core.transaction import get_current_conn
 
-        if isinstance(conn_or_pool, asyncpg.Pool):
-            async with conn_or_pool.acquire() as conn:
+        id_mapping = {}
+        in_tx = get_current_conn() is not None
+
+        async with self.acquire_connection() as conn:
+            if in_tx:
+                id_mapping = await self._execute_save(conn, changes)
+            else:
                 async with conn.transaction():
                     id_mapping = await self._execute_save(conn, changes)
-        else:
-            id_mapping = await self._execute_save(conn_or_pool, changes)
 
         graph.clear_dirty(keys=persisted_keys)
         return id_mapping
@@ -527,7 +487,7 @@ class PostgresGraphStorage:
                 vals = item["vals"]
 
                 table_name = self._safe_ident(model_name.replace(".", "_"))
-                fields_cfg = Registry.get_fields_for_model(model_name)
+                fields_cfg = Registry.get_schema_fields_for_model(model_name)
 
                 is_new = not str(rec_id).isdigit()
                 phys: Dict[str, Any] = {}

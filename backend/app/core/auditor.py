@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 from app.core.event_bus import EventBus
 from app.core.worker import WorkerEngine
 from app.core.env import Context
+from app.core.payloads import normalize_changes, normalize_payload
 
 
 class AuditService:
@@ -66,33 +67,28 @@ class AuditService:
         return "write"
 
     @staticmethod
+    def _resolve_user_id() -> Optional[int]:
+        env = Context.get_env()
+        if env and str(getattr(env, "uid", "")).isdigit():
+            return int(env.uid)
+        return None
+
+    @staticmethod
+    def _resolve_res_id(record: Any = None, record_id: Any = None) -> Any:
+        raw = record_id
+        if raw is None and record is not None:
+            raw = getattr(record, "id", None)
+        return int(raw) if str(raw).isdigit() else raw
+
+    @staticmethod
     def _clean_changes(changes: Optional[Dict]) -> Optional[Dict]:
         """
-        Normaliza el dict de changes a formato {campo: {old, new}}.
-        Compatible con formato nuevo y legacy.
+        Normalización canónica:
+        - formato {field: {old, new}}
+        - JSON-safe
+        - sin campos de sistema irrelevantes
         """
-        if not changes:
-            return None
-
-        skip_fields = {
-            "write_version", "write_date", "write_uid",
-            "create_date", "create_uid", "id",
-        }
-
-        cleaned = {}
-        for field, value in changes.items():
-            if field in skip_fields:
-                continue
-
-            if isinstance(value, dict) and "old" in value and "new" in value:
-                old_val = value["old"]
-                new_val = value["new"]
-                if old_val != new_val:
-                    cleaned[field] = {"old": old_val, "new": new_val}
-            else:
-                cleaned[field] = {"old": None, "new": value}
-
-        return cleaned if cleaned else None
+        return normalize_changes(changes)
 
     @classmethod
     async def on_record_created(
@@ -107,7 +103,8 @@ class AuditService:
         if record is None:
             return
 
-        res_id = int(record.id) if str(record.id).isdigit() else record.id
+        res_id = cls._resolve_res_id(record=record)
+        user_id = cls._resolve_user_id()
 
         await WorkerEngine.enqueue(
             model_name="ir.audit.log",
@@ -115,6 +112,7 @@ class AuditService:
             kwargs={
                 "res_model": model_name,
                 "res_id": res_id,
+                "user_id": user_id,
                 "action": cls._normalize_action(action or "create"),
                 "changes": None,
                 "message": None,
@@ -128,6 +126,7 @@ class AuditService:
         record: Any = None,
         changes: Dict = None,
         action: str = None,
+        payload_snapshot: Dict = None,
         **kwargs,
     ):
         if cls._should_skip(model_name):
@@ -135,8 +134,14 @@ class AuditService:
         if record is None:
             return
 
-        res_id = int(record.id) if str(record.id).isdigit() else record.id
+        res_id = cls._resolve_res_id(record=record)
+        user_id = cls._resolve_user_id()
+
         cleaned_changes = cls._clean_changes(changes)
+
+        # Si el change set queda vacío tras limpiar ruido técnico, no auditar basura.
+        if not cleaned_changes:
+            return
 
         await WorkerEngine.enqueue(
             model_name="ir.audit.log",
@@ -144,6 +149,7 @@ class AuditService:
             kwargs={
                 "res_model": model_name,
                 "res_id": res_id,
+                "user_id": user_id,
                 "action": cls._normalize_action(action or "write"),
                 "changes": cleaned_changes,
                 "message": None,
@@ -163,7 +169,8 @@ class AuditService:
         if record_id is None:
             return
 
-        res_id = int(record_id) if str(record_id).isdigit() else record_id
+        res_id = cls._resolve_res_id(record_id=record_id)
+        user_id = cls._resolve_user_id()
 
         await WorkerEngine.enqueue(
             model_name="ir.audit.log",
@@ -171,8 +178,35 @@ class AuditService:
             kwargs={
                 "res_model": model_name,
                 "res_id": res_id,
+                "user_id": user_id,
                 "action": cls._normalize_action(action or "unlink"),
                 "changes": None,
                 "message": None,
+            },
+        )
+
+    @classmethod
+    async def enqueue_error(
+        cls,
+        *,
+        res_model: str,
+        res_id: Any = 0,
+        message: Any = None,
+        changes: Optional[Dict] = None,
+        user_id: Optional[int] = None,
+    ):
+        """
+        Entrada explícita para errores forenses futuros.
+        """
+        await WorkerEngine.enqueue(
+            model_name="ir.audit.log",
+            method_name="create_from_queue",
+            kwargs={
+                "res_model": res_model,
+                "res_id": int(res_id) if str(res_id).isdigit() else res_id,
+                "user_id": user_id if user_id is not None else cls._resolve_user_id(),
+                "action": "error",
+                "changes": normalize_changes(changes),
+                "message": normalize_payload(message) if message is not None else None,
             },
         )

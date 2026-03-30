@@ -71,6 +71,38 @@ class Model:
         return cls._auto_name
 
     @classmethod
+    def _declared_fields(cls) -> Dict[str, Field]:
+        """
+        Devuelve únicamente los campos declarados del modelo.
+        No incluye properties, helpers ni atributos runtime.
+        """
+        result: Dict[str, Field] = {}
+        for name in dir(cls):
+            attr = getattr(cls, name, None)
+            if hasattr(attr, "get_meta"):
+                result[name] = attr
+        return result
+
+    @classmethod
+    def _sanitize_input_vals(cls, vals: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Acepta solo campos declarados del modelo.
+        Bloquea display_name y cualquier atributo de presentación/propiedad.
+        """
+        vals = dict(vals or {})
+        declared = cls._declared_fields()
+
+        safe: Dict[str, Any] = {}
+        for key, value in vals.items():
+            if key == "id":
+                safe[key] = value
+                continue
+            if key in declared:
+                safe[key] = value
+
+        return safe
+
+    @classmethod
     async def _check_create_access(cls):
         env = Context.get_env()
         if not env or getattr(env, "su", False) or str(getattr(env, "uid", "")) == "system":
@@ -121,6 +153,7 @@ class Model:
             "password": "VARCHAR(255)",
             "text": "TEXT",
             "int": "INTEGER",
+            "integer": "INTEGER",
             "float": "DOUBLE PRECISION",
             "decimal": "NUMERIC",
             "monetary": "NUMERIC",
@@ -139,13 +172,8 @@ class Model:
                 table_name,
             )
 
-            fields_meta = {}
-            for name in dir(cls):
-                attr = getattr(cls, name, None)
-                if hasattr(attr, "get_meta"):
-                    meta = attr.get_meta()
-                    if meta.get("store", True) and meta.get("type") not in ["one2many", "many2many"]:
-                        fields_meta[name] = meta
+            from app.core.registry import Registry
+            fields_meta = Registry.get_schema_fields_for_model(cls._get_model_name())
 
             if not table_exists:
                 print(f"🛠️ [DDL] Evolución Inicial: Creando tabla {table_name}...")
@@ -234,7 +262,7 @@ class Model:
         graph = context if context else (Context.get_graph() or Graph())
 
         async with AsyncGraphSavepoint(env):
-            vals = dict(vals or {})
+            vals = cls._sanitize_input_vals(vals)
             o2m_data = {}
 
             for key in list(vals.keys()):
@@ -258,13 +286,12 @@ class Model:
                 "write_version": 1,
             })
 
-            for name in dir(cls):
-                attr = getattr(cls, name, None)
-                if isinstance(attr, Field) and name not in vals:
+            for name, attr in cls._declared_fields().items():
+                if name not in vals:
                     vals[name] = attr.default() if callable(attr.default) else attr.default
 
             for key, value in vals.items():
-                if key != "id" and hasattr(record, key):
+                if key != "id" and key in cls._declared_fields():
                     setattr(record, key, value)
 
             if o2m_data:
@@ -283,7 +310,7 @@ class Model:
 
                     for line in lines:
                         if isinstance(line, dict):
-                            line_vals = {k: v for k, v in line.items() if k != "id"}
+                            line_vals = ChildModel._sanitize_input_vals({k: v for k, v in line.items() if k != "id"})
                             line_vals[inverse_name] = record.id
                             new_child = await ChildModel.create(line_vals, context=graph)
                             saved_ids.append(new_child.id)
@@ -405,6 +432,26 @@ class Model:
         graph = context or Context.get_graph()
         return Recordset(cls, [cls(_id=i, context=graph, env=env) for i in unique_ids], env)
 
+    @classmethod
+    async def name_search(
+        cls,
+        query: str = "",
+        limit: int = 10,
+        context: Optional[Graph] = None,
+    ) -> List[List[Union[int, str]]]:
+        domain = []
+        rec_name = getattr(cls, "_rec_name", "name")
+
+        if query:
+            domain = [(rec_name, "ilike", query)]
+
+        rs = await cls.search(domain=domain, limit=limit, context=context)
+        if rs and hasattr(rs, "read"):
+            rows = await rs.read(fields=[rec_name])
+            return [[row["id"], row.get(rec_name) or row.get("display_name") or str(row["id"])] for row in rows]
+
+        return []
+
     def __repr__(self):
         return f"<{self.__class__.__name__}({self._id_val})>"
 
@@ -424,8 +471,6 @@ class Model:
                 for name in dir(cls):
                     attr = getattr(cls, name, None)
                     if hasattr(attr, "get_meta"):
-                        meta = attr.get_meta()
-                        if meta.get("store", True):
-                            Registry.register_field(model_name, name, meta)
+                        Registry.register_field_family(model_name, name, attr.get_meta())
         except Exception as e:
             print(f"⚠️ Error registrando modelo '{getattr(cls, '__name__', cls)}': {e}")

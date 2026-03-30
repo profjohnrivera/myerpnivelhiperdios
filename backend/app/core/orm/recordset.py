@@ -156,6 +156,263 @@ class Recordset:
         await self._check_acl(operation)
         await self._check_row_rules(operation)
 
+    @staticmethod
+    def _is_pool(conn_or_pool) -> bool:
+        return hasattr(conn_or_pool, "acquire")
+
+    async def _fetch(self, query: str, *args):
+        from app.core.storage.postgres_storage import PostgresGraphStorage
+
+        storage = PostgresGraphStorage()
+        conn_or_pool = await storage.get_connection()
+
+        if self._is_pool(conn_or_pool):
+            async with conn_or_pool.acquire() as conn:
+                return await conn.fetch(query, *args)
+        return await conn_or_pool.fetch(query, *args)
+
+    async def _fetchrow(self, query: str, *args):
+        from app.core.storage.postgres_storage import PostgresGraphStorage
+
+        storage = PostgresGraphStorage()
+        conn_or_pool = await storage.get_connection()
+
+        if self._is_pool(conn_or_pool):
+            async with conn_or_pool.acquire() as conn:
+                return await conn.fetchrow(query, *args)
+        return await conn_or_pool.fetchrow(query, *args)
+
+    @staticmethod
+    def _row_to_dict(storage, row) -> Dict[str, Any]:
+        row_dict: Dict[str, Any] = {}
+        for col, val in row.items():
+            if col == "x_ext" and val:
+                extra = val if isinstance(val, dict) else (json.loads(val) if isinstance(val, str) else dict(val))
+                row_dict.update(extra)
+            else:
+                row_dict[col] = storage._parse_db_value(val) if hasattr(storage, "_parse_db_value") else val
+        return row_dict
+
+    async def _read_rows_bulk(self, model_name: str, record_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        from app.core.storage.postgres_storage import PostgresGraphStorage
+
+        clean_ids = [int(i) for i in record_ids if str(i).isdigit()]
+        if not clean_ids:
+            return {}
+
+        storage = PostgresGraphStorage()
+        table_name = model_name.replace(".", "_")
+
+        try:
+            rows = await self._fetch(f'SELECT * FROM "{table_name}" WHERE id = ANY($1::bigint[])', clean_ids)
+            return {int(row["id"]): self._row_to_dict(storage, row) for row in rows}
+        except Exception as e:
+            print(f"⚠️ Error leyendo filas bulk de {model_name}: {e}")
+            return {}
+
+    @staticmethod
+    def _find_inverse_field(child_model_name: str, parent_model_name: str, parent_field_name: str | None = None) -> str:
+        from app.core.registry import Registry
+
+        if parent_field_name:
+            parent_cls = Registry.get_model(parent_model_name)
+            parent_attr = getattr(parent_cls, parent_field_name, None)
+            if parent_attr and hasattr(parent_attr, "inverse_name") and parent_attr.inverse_name:
+                return parent_attr.inverse_name
+
+        child_cls = Registry.get_model(child_model_name)
+        for fname in dir(child_cls):
+            attr = getattr(child_cls, fname, None)
+            if hasattr(attr, "get_meta"):
+                meta = attr.get_meta()
+                if meta.get("type") in ("relation", "many2one"):
+                    target = getattr(attr, "related_model", "") or meta.get("target", "")
+                    if Registry._resolve_name(str(target)) == parent_model_name:
+                        return fname
+
+        return parent_model_name.split(".")[-1] + "_id"
+
+    @staticmethod
+    def _normalize_json_value(val: Any, translate: bool = False, lang: str = "en_US") -> Any:
+        if translate and isinstance(val, dict):
+            return val.get(lang, list(val.values())[0] if val else "")
+
+        if isinstance(val, decimal.Decimal):
+            return float(val)
+        if isinstance(val, datetime.datetime):
+            return val.isoformat()
+        if isinstance(val, datetime.date):
+            return val.isoformat()
+
+        return val
+
+    async def _resolve_m2o_cache(
+        self,
+        base_rows: List[Dict[str, Any]],
+        m2o_fields: Dict[str, str],
+    ) -> Dict[str, Dict[int, List[Any]]]:
+        from app.core.registry import Registry
+
+        m2o_cache: Dict[str, Dict[int, List[Any]]] = {}
+
+        for fname, target_model in m2o_fields.items():
+            if not target_model:
+                continue
+
+            target_cls = Registry.get_model(target_model)
+            rec_name = getattr(target_cls, "_rec_name", "name")
+
+            target_ids = list({
+                row.get(fname)
+                for row in base_rows
+                if row.get(fname) and not isinstance(row.get(fname), list)
+            })
+            target_int_ids = [int(i) for i in target_ids if str(i).isdigit()]
+
+            if not target_int_ids:
+                m2o_cache[target_model] = {}
+                continue
+
+            target_rows = await self._read_rows_bulk(target_model, target_int_ids)
+            resolved = {}
+
+            for raw_id, row in target_rows.items():
+                display = row.get(rec_name) or row.get("name") or row.get("display_name") or str(raw_id)
+                resolved[int(raw_id)] = [int(raw_id), display]
+
+            m2o_cache[target_model] = resolved
+
+        return m2o_cache
+
+    async def _resolve_o2m_payloads(
+        self,
+        parent_model: str,
+        parent_ids: List[int],
+        o2m_fields: Dict[str, str],
+    ) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
+        from app.core.registry import Registry
+        from app.core.storage.postgres_storage import PostgresGraphStorage
+
+        payloads: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
+        storage = PostgresGraphStorage()
+
+        for field_name, target_model in o2m_fields.items():
+            grouped_children: Dict[int, List[Dict[str, Any]]] = {pid: [] for pid in parent_ids}
+
+            if not target_model:
+                payloads[field_name] = grouped_children
+                continue
+
+            inverse_field = self._find_inverse_field(target_model, parent_model, field_name)
+            child_table = target_model.replace(".", "_")
+
+            try:
+                child_rows_raw = await self._fetch(
+                    f'SELECT * FROM "{child_table}" WHERE "{inverse_field}" = ANY($1::bigint[])',
+                    parent_ids,
+                )
+            except Exception:
+                payloads[field_name] = grouped_children
+                continue
+
+            child_model_cls = Registry.get_model(target_model)
+
+            child_m2o_fields: Dict[str, str] = {}
+            for cfname in dir(child_model_cls):
+                cattr = getattr(child_model_cls, cfname, None)
+                if hasattr(cattr, "get_meta"):
+                    cmeta = cattr.get_meta()
+                    if cmeta.get("type") in ("relation", "many2one"):
+                        child_m2o_fields[cfname] = getattr(cattr, "related_model", None) or cmeta.get("target")
+
+            children_list = []
+            for row in child_rows_raw:
+                children_list.append(self._row_to_dict(storage, row))
+
+            child_m2o_cache = await self._resolve_m2o_cache(children_list, child_m2o_fields) if children_list else {}
+            rec_name_field = getattr(child_model_cls, "_rec_name", "name")
+
+            for child in children_list:
+                for cfname, ctarget_model in child_m2o_fields.items():
+                    raw_id = child.get(cfname)
+                    if raw_id and str(raw_id).isdigit():
+                        child[cfname] = child_m2o_cache.get(ctarget_model, {}).get(int(raw_id), [int(raw_id), str(raw_id)])
+
+                if rec_name_field and rec_name_field in child and "name" not in child:
+                    child["name"] = child[rec_name_field]
+
+                p_id = child.get(inverse_field)
+                if isinstance(p_id, list) and p_id:
+                    p_id = p_id[0]
+                if p_id and int(p_id) in grouped_children:
+                    grouped_children[int(p_id)].append(child)
+
+            payloads[field_name] = grouped_children
+
+        return payloads
+
+    async def _resolve_m2m_payloads(
+        self,
+        model_name: str,
+        record_ids: List[int],
+        m2m_fields: Dict[str, str],
+    ) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
+        from app.core.registry import Registry
+
+        payloads: Dict[str, Dict[int, List[Dict[str, Any]]]] = {}
+        parent_table = model_name.replace(".", "_")
+
+        for field_name, target_model in m2m_fields.items():
+            grouped = {rid: [] for rid in record_ids}
+
+            if not target_model:
+                payloads[field_name] = grouped
+                continue
+
+            rel_table = f"{parent_table}_{field_name}_rel"
+            target_table = target_model.replace(".", "_")
+
+            try:
+                rel_rows = await self._fetch(
+                    f'SELECT base_id, rel_id FROM "{rel_table}" WHERE base_id = ANY($1::bigint[])',
+                    record_ids,
+                )
+            except Exception:
+                payloads[field_name] = grouped
+                continue
+
+            all_rel_ids = list({int(r["rel_id"]) for r in rel_rows if str(r["rel_id"]).isdigit()})
+            target_data: Dict[int, Dict[str, Any]] = {}
+
+            if all_rel_ids:
+                try:
+                    target_cls = Registry.get_model(target_model)
+                    rec_name_field = getattr(target_cls, "_rec_name", "name") if target_cls else "name"
+                    has_color = bool(target_cls and hasattr(target_cls, "color"))
+                    cols = f'"id", "{rec_name_field}"' + (', "color"' if has_color else "")
+                    target_rows = await self._fetch(
+                        f'SELECT {cols} FROM "{target_table}" WHERE id = ANY($1::bigint[])',
+                        all_rel_ids,
+                    )
+
+                    for tr in target_rows:
+                        obj = {"id": tr["id"], "name": tr.get(rec_name_field) or str(tr["id"])}
+                        if has_color:
+                            obj["color"] = tr.get("color", 0)
+                        target_data[int(tr["id"])] = obj
+                except Exception:
+                    for rid in all_rel_ids:
+                        target_data[int(rid)] = {"id": int(rid), "name": str(rid)}
+
+            for rel_row in rel_rows:
+                bid = int(rel_row["base_id"])
+                rid = int(rel_row["rel_id"])
+                grouped.setdefault(bid, []).append(target_data.get(rid, {"id": rid, "name": str(rid)}))
+
+            payloads[field_name] = grouped
+
+        return payloads
+
     async def load_data(self) -> "Recordset":
         if not self._records:
             return self
@@ -163,35 +420,26 @@ class Recordset:
         from app.core.storage.postgres_storage import PostgresGraphStorage
 
         storage = PostgresGraphStorage()
-        conn = await storage.get_connection()
-
         model_name = self._model_class._get_model_name()
-        table_name = model_name.replace(".", "_")
         graph = self._get_graph()
 
         ids = [r.id for r in self._records if str(r.id).isdigit()]
         if not ids:
             return self
 
+        table_name = model_name.replace(".", "_")
+
         try:
-            query = f'SELECT * FROM "{table_name}" WHERE id = ANY($1::bigint[])'
-            rows = await conn.fetch(query, ids)
+            rows = await self._fetch(f'SELECT * FROM "{table_name}" WHERE id = ANY($1::bigint[])', ids)
             dirty_nodes = getattr(graph, "_dirty_nodes", set())
 
             for row in rows:
                 row_id = row["id"]
-                for k, v in row.items():
-                    if k == "x_ext" and v:
-                        extra = v if isinstance(v, dict) else (json.loads(v) if isinstance(v, str) else dict(v))
-                        for ek, ev in extra.items():
-                            node_name = (model_name, row_id, ek)
-                            if node_name not in dirty_nodes:
-                                graph._values[node_name] = ev
-                    else:
-                        parsed_v = storage._parse_db_value(v) if hasattr(storage, "_parse_db_value") else v
-                        node_name = (model_name, row_id, k)
-                        if node_name not in dirty_nodes:
-                            graph._values[node_name] = parsed_v
+                row_dict = self._row_to_dict(storage, row)
+                for k, v in row_dict.items():
+                    node_name = (model_name, row_id, k)
+                    if node_name not in dirty_nodes:
+                        graph._values[node_name] = v
         except Exception as e:
             print(f"⚠️ Error en Bulk Load de {model_name}: {e}")
 
@@ -207,7 +455,6 @@ class Recordset:
         from app.core.storage.postgres_storage import PostgresGraphStorage
 
         storage = PostgresGraphStorage()
-        conn = await storage.get_connection()
         graph = self._get_graph()
         env = self._get_env()
 
@@ -232,7 +479,6 @@ class Recordset:
 
                 TargetModel = Registry.get_model(target_model_name)
                 target_table = target_model_name.replace(".", "_")
-
                 next_rs_records = []
 
                 if f_type in ["relation", "many2one"]:
@@ -251,39 +497,33 @@ class Recordset:
                         elif val and isinstance(val, int):
                             target_ids.add(str(val))
 
-                    target_ids = list(filter(None, target_ids))
                     target_int_ids = [int(i) for i in target_ids if str(i).isdigit()]
 
                     if target_int_ids:
-                        query = f'SELECT * FROM "{target_table}" WHERE id = ANY($1::bigint[])'
-                        rows = await conn.fetch(query, target_int_ids)
+                        rows = await self._fetch(
+                            f'SELECT * FROM "{target_table}" WHERE id = ANY($1::bigint[])',
+                            target_int_ids,
+                        )
                         dirty_nodes = getattr(graph, "_dirty_nodes", set())
 
                         for row in rows:
                             row_id = row["id"]
                             next_rs_records.append(TargetModel(_id=row_id, context=graph, env=env))
-                            for k, v in row.items():
-                                if k == "x_ext" and v:
-                                    extra = v if isinstance(v, dict) else (
-                                        json.loads(v) if isinstance(v, str) else dict(v)
-                                    )
-                                    for ek, ev in extra.items():
-                                        node_name = (target_model_name, row_id, ek)
-                                        if node_name not in dirty_nodes:
-                                            graph._values[node_name] = ev
-                                else:
-                                    parsed_v = storage._parse_db_value(v) if hasattr(storage, "_parse_db_value") else v
-                                    node_name = (target_model_name, row_id, k)
-                                    if node_name not in dirty_nodes:
-                                        graph._values[node_name] = parsed_v
+                            row_dict = self._row_to_dict(storage, row)
+                            for k, v in row_dict.items():
+                                node_name = (target_model_name, row_id, k)
+                                if node_name not in dirty_nodes:
+                                    graph._values[node_name] = v
 
                 elif f_type == "one2many":
                     inverse = attr.inverse_name or f"{model_cls._get_model_name().split('.')[-1]}_id"
                     parent_ids = [r.id for r in current_rs if str(r.id).isdigit()]
 
                     if parent_ids:
-                        query = f'SELECT * FROM "{target_table}" WHERE "{inverse}" = ANY($1::bigint[])'
-                        rows = await conn.fetch(query, parent_ids)
+                        rows = await self._fetch(
+                            f'SELECT * FROM "{target_table}" WHERE "{inverse}" = ANY($1::bigint[])',
+                            parent_ids,
+                        )
 
                         grouped = {pid: [] for pid in parent_ids}
                         dirty_nodes = getattr(graph, "_dirty_nodes", set())
@@ -295,24 +535,16 @@ class Recordset:
                                 grouped[p_id].append(row_id)
                             next_rs_records.append(TargetModel(_id=row_id, context=graph, env=env))
 
-                            for k, v in row.items():
-                                if k == "x_ext" and v:
-                                    extra = v if isinstance(v, dict) else (
-                                        json.loads(v) if isinstance(v, str) else dict(v)
-                                    )
-                                    for ek, ev in extra.items():
-                                        node_name = (target_model_name, row_id, ek)
-                                        if node_name not in dirty_nodes:
-                                            graph._values[node_name] = ev
-                                else:
-                                    parsed_v = storage._parse_db_value(v) if hasattr(storage, "_parse_db_value") else v
-                                    node_name = (target_model_name, row_id, k)
-                                    if node_name not in dirty_nodes:
-                                        graph._values[node_name] = parsed_v
+                            row_dict = self._row_to_dict(storage, row)
+                            for k, v in row_dict.items():
+                                node_name = (target_model_name, row_id, k)
+                                if node_name not in dirty_nodes:
+                                    graph._values[node_name] = v
 
                         for rec in current_rs:
                             if not str(rec.id).isdigit():
                                 continue
+
                             children_ids = grouped.get(rec.id, [])
                             children_instances = [
                                 TargetModel(_id=cid, context=graph, env=env)
@@ -333,132 +565,81 @@ class Recordset:
         if not self._records:
             return []
 
-        from app.core.storage.postgres_storage import PostgresGraphStorage
-
-        storage = PostgresGraphStorage()
-        conn = await storage.get_connection()
-
         model_name = self._model_class._get_model_name()
-        table_name = model_name.replace(".", "_")
-        ids = [r.id for r in self._records if str(r.id).isdigit()]
-
-        if not ids:
+        record_ids = [r.id for r in self._records if str(r.id).isdigit()]
+        if not record_ids:
             return []
 
-        query = f'SELECT * FROM "{table_name}" WHERE id = ANY($1::bigint[])'
-        rows = await conn.fetch(query, ids)
-        db_data = {row["id"]: dict(row) for row in rows}
+        rows_map = await self._read_rows_bulk(model_name, record_ids)
+        if not rows_map:
+            return []
 
-        m2o_fields = {}
-        o2m_fields = {}
-
-        for name in dir(self._model_class):
-            if fields and name not in fields and name != "id":
-                continue
-
-            attr = getattr(self._model_class, name, None)
-            if hasattr(attr, "get_meta"):
-                meta = attr.get_meta()
-                f_type = meta.get("type")
-
-                if f_type in ["relation", "many2one"]:
-                    t_model = getattr(attr, "related_model", None) or meta.get("target")
-                    if t_model:
-                        m2o_fields[name] = t_model
-                elif f_type == "one2many":
-                    t_model = attr.related_model
-                    inv_name = attr.inverse_name or f"{model_name.split('.')[-1]}_id"
-                    o2m_fields[name] = (t_model, inv_name)
-
-        m2o_cache = {}
-        for f_name, t_model in m2o_fields.items():
-            t_table = t_model.replace(".", "_")
-            target_ids = list({
-                db_data[rid][f_name]
-                for rid in ids
-                if db_data.get(rid) and db_data[rid].get(f_name)
-            })
-            target_int_ids = [int(x) for x in target_ids if str(x).isdigit()]
-
-            if target_int_ids:
-                try:
-                    m2o_query = f'SELECT id, name, display_name FROM "{t_table}" WHERE id = ANY($1::bigint[])'
-                    m2o_rows = await conn.fetch(m2o_query, target_int_ids)
-                    m2o_cache[t_model] = {
-                        r["id"]: [r["id"], r.get("name") or r.get("display_name") or str(r["id"])]
-                        for r in m2o_rows
-                    }
-                except Exception:
-                    m2o_cache[t_model] = {}
-
-        o2m_cache = {}
-        for f_name, (t_model, inv_name) in o2m_fields.items():
-            t_table = t_model.replace(".", "_")
-            try:
-                o2m_query = f'SELECT * FROM "{t_table}" WHERE "{inv_name}" = ANY($1::bigint[])'
-                o2m_rows = await conn.fetch(o2m_query, ids)
-
-                grouped = {rid: [] for rid in ids}
-                for r in o2m_rows:
-                    p_id = r[inv_name]
-                    if p_id in grouped:
-                        c_dict = {k: v for k, v in dict(r).items() if not isinstance(v, (list, dict))}
-                        c_dict["id"] = r["id"]
-                        grouped[p_id].append(c_dict)
-
-                o2m_cache[f_name] = grouped
-            except Exception:
-                o2m_cache[f_name] = {rid: [] for rid in ids}
-
+        model_cls = self._model_class
         env = self._get_env()
         lang = getattr(env, "lang", "en_US") if env else "en_US"
-        results = []
 
-        for rec in self._records:
-            if not str(rec.id).isdigit():
+        m2o_fields: Dict[str, str] = {}
+        o2m_fields: Dict[str, str] = {}
+        m2m_fields: Dict[str, str] = {}
+        scalar_fields: Dict[str, Dict[str, Any]] = {}
+
+        for fname in dir(model_cls):
+            if fields and fname not in fields and fname != "id":
                 continue
 
-            rec_id = rec.id
-            if rec_id not in db_data:
+            attr = getattr(model_cls, fname, None)
+            if not hasattr(attr, "get_meta"):
                 continue
 
-            row = db_data[rec_id]
-            res = {"id": rec_id}
+            meta = attr.get_meta()
+            ftype = meta.get("type")
 
-            for f_name in dir(self._model_class):
-                if fields and f_name not in fields and f_name != "id":
-                    continue
+            if ftype in ("relation", "many2one"):
+                m2o_fields[fname] = getattr(attr, "related_model", None) or meta.get("target")
+            elif ftype == "one2many":
+                o2m_fields[fname] = getattr(attr, "related_model", None) or meta.get("target")
+            elif ftype == "many2many":
+                m2m_fields[fname] = getattr(attr, "related_model", None) or meta.get("target")
+            else:
+                scalar_fields[fname] = meta
 
-                attr = getattr(self._model_class, f_name, None)
-                if not hasattr(attr, "get_meta"):
-                    continue
+        base_rows = [dict(rows_map.get(int(rid), {"id": int(rid)})) for rid in record_ids]
 
-                meta = attr.get_meta()
-                f_type = meta.get("type")
+        m2o_cache = await self._resolve_m2o_cache(base_rows, m2o_fields)
+        o2m_payloads = await self._resolve_o2m_payloads(model_name, record_ids, o2m_fields)
+        m2m_payloads = await self._resolve_m2m_payloads(model_name, record_ids, m2m_fields)
 
-                if f_type in ["relation", "many2one"]:
-                    val = row.get(f_name)
-                    if val and m2o_fields.get(f_name) in m2o_cache:
-                        res[f_name] = m2o_cache[m2o_fields[f_name]].get(val, val)
-                    else:
-                        res[f_name] = False
+        results: List[Dict[str, Any]] = []
 
-                elif f_type == "one2many":
-                    res[f_name] = o2m_cache.get(f_name, {}).get(rec_id, [])
+        for rec_id in record_ids:
+            row = rows_map.get(int(rec_id))
+            if not row:
+                continue
 
+            res: Dict[str, Any] = {"id": int(rec_id)}
+
+            for fname, meta in scalar_fields.items():
+                val = row.get(fname)
+                res[fname] = self._normalize_json_value(
+                    val,
+                    translate=bool(meta.get("translate")),
+                    lang=lang,
+                )
+
+            for fname, target_model in m2o_fields.items():
+                raw_id = row.get(fname)
+                if raw_id and str(raw_id).isdigit():
+                    res[fname] = m2o_cache.get(target_model, {}).get(int(raw_id), [int(raw_id), str(raw_id)])
                 else:
-                    val = row.get(f_name)
-                    if meta.get("translate") and isinstance(val, dict):
-                        val = val.get(lang, list(val.values())[0] if val else "")
+                    res[fname] = False
 
-                    if isinstance(val, decimal.Decimal):
-                        res[f_name] = float(val)
-                    elif isinstance(val, datetime.datetime):
-                        res[f_name] = val.isoformat()
-                    else:
-                        res[f_name] = val
+            for fname in o2m_fields.keys():
+                res[fname] = o2m_payloads.get(fname, {}).get(int(rec_id), [])
 
-            res["display_name"] = res.get("name") or res.get("display_name") or f"{model_name}({rec_id})"
+            for fname in m2m_fields.keys():
+                res[fname] = m2m_payloads.get(fname, {}).get(int(rec_id), [])
+
+            res["display_name"] = res.get("name") or row.get("display_name") or f"{model_name}({rec_id})"
             results.append(res)
 
         return results
@@ -487,7 +668,7 @@ class Recordset:
             table_name = model_name.replace(".", "_")
             ids = [int(r.id) for r in self._records if str(r.id).isdigit()]
 
-            vals = dict(vals or {})
+            vals = self._model_class._sanitize_input_vals(vals)
             frontend_version = vals.pop("write_version", None)
             db_versions = {}
 
@@ -539,8 +720,11 @@ class Recordset:
 
                 local_vals.update({"write_date": now, "write_uid": uid})
 
+                declared_fields = self._model_class._declared_fields()
                 for key, value in local_vals.items():
-                    if key != "id" and hasattr(rec, key):
+                    if key == "id":
+                        continue
+                    if key in declared_fields:
                         setattr(rec, key, value)
 
             if o2m_data:
@@ -564,7 +748,7 @@ class Recordset:
                         for line in lines:
                             if isinstance(line, dict):
                                 line_id = line.get("id", "")
-                                line_vals = {k: v for k, v in line.items() if k != "id"}
+                                line_vals = ChildModel._sanitize_input_vals({k: v for k, v in line.items() if k != "id"})
                                 line_vals[inverse_name] = rec.id
 
                                 if line_id and str(line_id).isdigit() and int(line_id) in current_ids:

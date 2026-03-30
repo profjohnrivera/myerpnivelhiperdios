@@ -7,18 +7,25 @@ class Registry:
     """
     🧠 EL CEREBRO DE METADATOS (Registry Constitucional)
 
+    Separación definitiva:
+    - _runtime_fields   -> todos los campos declarados del modelo Python
+    - _technical_fields -> catálogo técnico para ir.model.fields
+    - _schema_fields    -> campos que afectan DDL / persistencia física
+
     Reglas duras:
     - Re-registrar la MISMA clase es idempotente.
     - Registrar OTRA clase distinta con el mismo nombre técnico rompe.
-    - Después de freeze(), ya no se permiten cambios de schema
-      (modelos, _inherit, campos técnicos).
-    - El plano UI (views/menus) sigue abierto después de freeze()
-      porque se carga en Kernel.load_data().
+    - Después de freeze(), ya no se permiten cambios de schema/metamodelo.
+    - El plano UI (views/menus) sigue abierto después de freeze().
     """
 
     _models: Dict[str, Type] = {}
     _model_map: Dict[str, str] = {}
-    _fields: Dict[str, Dict[str, Any]] = {}
+
+    _runtime_fields: Dict[str, Dict[str, Any]] = {}
+    _technical_fields: Dict[str, Dict[str, Any]] = {}
+    _schema_fields: Dict[str, Dict[str, Any]] = {}
+
     _model_behaviors: Dict[str, List[str]] = {}
     _model_owner: Dict[str, str] = {}
 
@@ -32,12 +39,18 @@ class Registry:
     def reset(cls):
         cls._models = {}
         cls._model_map = {}
-        cls._fields = {}
+
+        cls._runtime_fields = {}
+        cls._technical_fields = {}
+        cls._schema_fields = {}
+
         cls._model_behaviors = {}
         cls._model_owner = {}
+
         cls._views = {}
         cls._menus = {}
         cls._modules = {}
+
         cls._frozen = False
 
     # =========================================================================
@@ -64,6 +77,132 @@ class Registry:
             raise RuntimeError(
                 f"❌ Registry sellado: no se puede {action} después de Kernel.prepare()."
             )
+
+    # =========================================================================
+    # HELPERS DE CAMPOS
+    # =========================================================================
+
+    @staticmethod
+    def _copy_meta(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        return dict(metadata or {})
+
+    @classmethod
+    def _field_affects_schema(cls, metadata: Dict[str, Any]) -> bool:
+        """
+        Campos que participan en schema/persistencia física:
+        - store=True
+        - excepto one2many (virtual por definición)
+        - many2many sí afecta schema por la tabla relacional
+        """
+        meta = metadata or {}
+        ftype = meta.get("type", "string")
+
+        if ftype == "one2many":
+            return False
+
+        if ftype == "many2many":
+            return True
+
+        return bool(meta.get("store", True))
+
+    @classmethod
+    def _ensure_field_buckets(cls, tech_name: str):
+        cls._runtime_fields.setdefault(tech_name, {})
+        cls._technical_fields.setdefault(tech_name, {})
+        cls._schema_fields.setdefault(tech_name, {})
+
+    @classmethod
+    def register_runtime_field(cls, model_name: str, field_name: str, metadata: Dict[str, Any]):
+        tech_name = cls._resolve_name(model_name)
+        cls._ensure_field_buckets(tech_name)
+
+        new_meta = cls._copy_meta(metadata)
+        existing = cls._runtime_fields[tech_name].get(field_name)
+
+        if existing == new_meta:
+            return
+
+        if existing is not None:
+            cls._ensure_schema_mutable(
+                f"redefinir runtime field '{field_name}' en modelo '{tech_name}'"
+            )
+        else:
+            cls._ensure_schema_mutable(
+                f"registrar runtime field '{field_name}' en modelo '{tech_name}'"
+            )
+
+        cls._runtime_fields[tech_name][field_name] = new_meta
+
+    @classmethod
+    def register_technical_field(cls, model_name: str, field_name: str, metadata: Dict[str, Any]):
+        tech_name = cls._resolve_name(model_name)
+        cls._ensure_field_buckets(tech_name)
+
+        new_meta = cls._copy_meta(metadata)
+        existing = cls._technical_fields[tech_name].get(field_name)
+
+        if existing == new_meta:
+            return
+
+        if existing is not None:
+            cls._ensure_schema_mutable(
+                f"redefinir technical field '{field_name}' en modelo '{tech_name}'"
+            )
+        else:
+            cls._ensure_schema_mutable(
+                f"registrar technical field '{field_name}' en modelo '{tech_name}'"
+            )
+
+        cls._technical_fields[tech_name][field_name] = new_meta
+
+    @classmethod
+    def register_schema_field(cls, model_name: str, field_name: str, metadata: Dict[str, Any]):
+        tech_name = cls._resolve_name(model_name)
+        cls._ensure_field_buckets(tech_name)
+
+        if not cls._field_affects_schema(metadata):
+            cls._schema_fields[tech_name].pop(field_name, None)
+            return
+
+        new_meta = cls._copy_meta(metadata)
+        existing = cls._schema_fields[tech_name].get(field_name)
+
+        if existing == new_meta:
+            return
+
+        if existing is not None:
+            cls._ensure_schema_mutable(
+                f"redefinir schema field '{field_name}' en modelo '{tech_name}'"
+            )
+        else:
+            cls._ensure_schema_mutable(
+                f"registrar schema field '{field_name}' en modelo '{tech_name}'"
+            )
+
+        cls._schema_fields[tech_name][field_name] = new_meta
+
+    @classmethod
+    def register_field_family(cls, model_name: str, field_name: str, metadata: Dict[str, Any]):
+        """
+        Registro canónico de un field:
+        - runtime: siempre
+        - technical: siempre
+        - schema: solo si afecta persistencia física
+        """
+        cls.register_runtime_field(model_name, field_name, metadata)
+        cls.register_technical_field(model_name, field_name, metadata)
+        cls.register_schema_field(model_name, field_name, metadata)
+
+    @classmethod
+    def unregister_schema_field(cls, model_name: str, field_name: str):
+        tech_name = cls._resolve_name(model_name)
+        cls._ensure_field_buckets(tech_name)
+        cls._schema_fields[tech_name].pop(field_name, None)
+
+    # Backward compatibility: mantener semántica antigua = schema
+    @classmethod
+    def register_field(cls, model_name: str, field_name: str, metadata: Dict):
+        cls.register_schema_field(model_name, field_name, metadata)
 
     # =========================================================================
     # 🧬 MODELOS
@@ -99,13 +238,13 @@ class Registry:
                     setattr(base_class, attr, val)
 
                     if hasattr(val, "get_meta"):
-                        cls.register_field(target_tech, attr, val.get_meta())
+                        cls.register_field_family(target_tech, attr, val.get_meta())
 
             if owner_module and target_tech not in cls._model_owner:
                 cls._model_owner[target_tech] = owner_module
 
             cls._model_map[class_name] = target_tech
-            cls._fields.setdefault(target_tech, {})
+            cls._ensure_field_buckets(target_tech)
             cls._scan_behaviors(target_tech, base_class)
             return
 
@@ -116,8 +255,8 @@ class Registry:
             existing_cls = cls._models[tech_name]
 
             same_class = (
-                existing_cls is model_cls or
-                (
+                existing_cls is model_cls
+                or (
                     getattr(existing_cls, "__module__", None) == getattr(model_cls, "__module__", None)
                     and getattr(existing_cls, "__name__", None) == getattr(model_cls, "__name__", None)
                 )
@@ -128,7 +267,7 @@ class Registry:
                     cls._model_owner[tech_name] = owner_module
 
                 cls._model_map[class_name] = tech_name
-                cls._fields.setdefault(tech_name, {})
+                cls._ensure_field_buckets(tech_name)
                 return
 
             previous_owner = cls._model_owner.get(tech_name, "desconocido")
@@ -144,7 +283,7 @@ class Registry:
 
         cls._models[tech_name] = model_cls
         cls._model_map[class_name] = tech_name
-        cls._fields.setdefault(tech_name, {})
+        cls._ensure_field_buckets(tech_name)
 
         if owner_module:
             cls._model_owner[tech_name] = owner_module
@@ -177,26 +316,6 @@ class Registry:
     def get_behaviors(cls, model_name: str) -> List[str]:
         tech_name = cls._resolve_name(model_name)
         return list(cls._model_behaviors.get(tech_name, []))
-
-    @classmethod
-    def register_field(cls, model_name: str, field_name: str, metadata: Dict):
-        tech_name = cls._resolve_name(model_name)
-        cls._fields.setdefault(tech_name, {})
-
-        existing = cls._fields[tech_name].get(field_name)
-        if existing == metadata:
-            return
-
-        if existing is not None:
-            cls._ensure_schema_mutable(
-                f"redefinir campo '{field_name}' en modelo '{tech_name}'"
-            )
-        else:
-            cls._ensure_schema_mutable(
-                f"registrar campo '{field_name}' en modelo '{tech_name}'"
-            )
-
-        cls._fields[tech_name][field_name] = metadata
 
     @classmethod
     def register_module(cls, name: str, icon: str, label: str):
@@ -242,13 +361,41 @@ class Registry:
         return cls._model_owner.get(tech_name)
 
     @classmethod
-    def get_fields_for_model(cls, tech_name: str):
+    def get_runtime_fields_for_model(cls, tech_name: str) -> Dict[str, Any]:
         tech_name = cls._resolve_name(tech_name)
-        return dict(cls._fields.get(tech_name, {}))
+        return dict(cls._runtime_fields.get(tech_name, {}))
+
+    @classmethod
+    def get_technical_fields_for_model(cls, tech_name: str) -> Dict[str, Any]:
+        tech_name = cls._resolve_name(tech_name)
+        return dict(cls._technical_fields.get(tech_name, {}))
+
+    @classmethod
+    def get_schema_fields_for_model(cls, tech_name: str) -> Dict[str, Any]:
+        tech_name = cls._resolve_name(tech_name)
+        return dict(cls._schema_fields.get(tech_name, {}))
+
+    # Backward compatibility:
+    # el contrato viejo se mantiene apuntando a schema_fields
+    @classmethod
+    def get_fields_for_model(cls, tech_name: str):
+        return cls.get_schema_fields_for_model(tech_name)
+
+    @classmethod
+    def get_all_runtime_fields(cls):
+        return {model: dict(fields) for model, fields in cls._runtime_fields.items()}
+
+    @classmethod
+    def get_all_technical_fields(cls):
+        return {model: dict(fields) for model, fields in cls._technical_fields.items()}
+
+    @classmethod
+    def get_all_schema_fields(cls):
+        return {model: dict(fields) for model, fields in cls._schema_fields.items()}
 
     @classmethod
     def get_all_fields(cls):
-        return {model: dict(fields) for model, fields in cls._fields.items()}
+        return cls.get_all_schema_fields()
 
     @classmethod
     def get_all_menus(cls) -> List[Dict[str, Any]]:

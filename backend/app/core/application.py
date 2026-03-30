@@ -46,7 +46,6 @@ class Application:
     def __init__(self) -> None:
         _validate_production_secrets()
 
-        # Instancia oficial del bus
         self.bus = EventBus()
         EventBus.set_active(self.bus)
 
@@ -71,35 +70,27 @@ class Application:
     async def _warm_up_system_config(self):
         """
         Carga SOLO ir.config_parameter en el graph maestro.
+
+        Consume el contrato único de get_connection():
+        siempre devuelve un objeto conexión-like.
         """
         try:
-            storage = PostgresGraphStorage()
-            conn_or_pool = await storage.get_connection()
-            query = 'SELECT * FROM "ir_config_parameter" LIMIT 500'
+            conn = await self.storage.get_connection()
+            rows = await conn.fetch('SELECT * FROM "ir_config_parameter" LIMIT 500')
 
-            try:
-                if hasattr(conn_or_pool, "acquire"):
-                    async with conn_or_pool.acquire() as conn:
-                        rows = await conn.fetch(query)
-                else:
-                    rows = await conn_or_pool.fetch(query)
+            for row in rows:
+                rec_id = row["id"]
+                for col, val in row.items():
+                    if col == "id":
+                        continue
+                    key = ("ir.config_parameter", rec_id, col)
+                    self.graph._values[key] = self.storage._parse_db_value(val)
+                    self.graph._versions[key] = 1
 
-                for row in rows:
-                    rec_id = row["id"]
-                    for col, val in row.items():
-                        if col == "id":
-                            continue
-                        key = ("ir.config_parameter", rec_id, col)
-                        self.graph._values[key] = storage._parse_db_value(val)
-                        self.graph._versions[key] = 1
+            print(f"   ✅ Sistema: {len(rows)} parámetros de configuración cargados en memoria.")
 
-                print(f"   ✅ Sistema: {len(rows)} parámetros de configuración cargados en memoria.")
-
-            except Exception:
-                print("   ℹ️  ir_config_parameter aún no existe, se creará en prepare().")
-
-        except Exception as e:
-            print(f"   ⚠️  Warm-up de configuración omitido: {e}")
+        except Exception:
+            print("   ℹ️  ir_config_parameter aún no existe, se creará en prepare().")
 
     async def emit(self, event: Any) -> None:
         try:

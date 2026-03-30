@@ -1,4 +1,5 @@
 # backend/app/core/module.py
+
 from typing import Type, Optional, List, Any
 
 from app.core.registry import Registry
@@ -15,6 +16,10 @@ class Module:
     - `depends` es la lista constitucional de dependencias
     - `register()` declara metadata, modelos, vistas y menús
     - `boot()` enciende servicios vivos del módulo
+
+    P0:
+    - self.bus debe apuntar al bus oficial del kernel/app
+    - NO fabricar EventBus() nuevo si el módulo ya vive dentro del Kernel
     """
     name: str = "base_module"
     depends: List[str] = []
@@ -23,7 +28,7 @@ class Module:
 
     def __init__(self, kernel=None):
         self.kernel = kernel
-        self.bus = EventBus()
+        self.bus = kernel.bus if kernel and getattr(kernel, "bus", None) else EventBus.get_instance()
 
     # =========================================================================
     # 🧬 HELPERS DE REGISTRO

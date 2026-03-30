@@ -1,4 +1,5 @@
 # backend/app/core/transaction.py
+
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import Optional, Any
@@ -7,6 +8,10 @@ import asyncpg
 
 
 class LazyNestedTransaction:
+    """
+    Savepoint anidado sobre la conexión raíz ya abierta.
+    """
+
     def __init__(self, proxy: "LazyConnectionProxy"):
         self._proxy = proxy
         self._tx: Optional[asyncpg.transaction.Transaction] = None
@@ -28,6 +33,12 @@ class LazyNestedTransaction:
 
 
 class LazyConnectionProxy:
+    """
+    Proxy raíz transaccional.
+    Adquiere la conexión del pool solo al primer uso y la mantiene viva
+    hasta commit/rollback de la transacción actual.
+    """
+
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool
         self._conn: Optional[asyncpg.Connection] = None
@@ -80,6 +91,39 @@ class LazyConnectionProxy:
         self._tx = None
 
 
+class PooledConnectionProxy:
+    """
+    Proxy NO transaccional con contrato idéntico al de una conexión:
+    fetch/fetchrow/fetchval/execute/executemany.
+
+    Cada operación adquiere y libera una conexión del pool automáticamente.
+    Así get_connection() SIEMPRE devuelve un objeto conexión-like.
+    """
+
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def execute(self, query: str, *args, **kwargs):
+        async with self._pool.acquire() as conn:
+            return await conn.execute(query, *args, **kwargs)
+
+    async def executemany(self, query: str, args, **kwargs):
+        async with self._pool.acquire() as conn:
+            return await conn.executemany(query, args, **kwargs)
+
+    async def fetch(self, query: str, *args, **kwargs):
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(query, *args, **kwargs)
+
+    async def fetchrow(self, query: str, *args, **kwargs):
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(query, *args, **kwargs)
+
+    async def fetchval(self, query: str, *args, **kwargs):
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval(query, *args, **kwargs)
+
+
 transaction_conn: ContextVar[Optional[LazyConnectionProxy]] = ContextVar(
     "transaction_conn",
     default=None,
@@ -89,9 +133,11 @@ transaction_conn: ContextVar[Optional[LazyConnectionProxy]] = ContextVar(
 @asynccontextmanager
 async def transaction():
     """
-    FIX P1-C: token siempre se resetea en finally.
-    Sin esto, una excepción dejaba el ContextVar apuntando
-    a un proxy muerto para el siguiente await del mismo Task.
+    Transacción raíz o anidada.
+
+    Garantías:
+    - savepoint real en anidadas
+    - token del ContextVar siempre reseteado en finally
     """
     from app.core.storage.postgres_storage import PostgresGraphStorage
 
@@ -100,7 +146,7 @@ async def transaction():
 
     existing_proxy = transaction_conn.get()
 
-    # Transacción anidada: savepoint sobre la raíz existente
+    # ── Transacción anidada: savepoint sobre la raíz existente ───────────────
     if existing_proxy is not None:
         nested = existing_proxy.transaction()
         await nested.start()
@@ -112,7 +158,7 @@ async def transaction():
             raise
         return
 
-    # Transacción raíz
+    # ── Transacción raíz ──────────────────────────────────────────────────────
     proxy = LazyConnectionProxy(pool)
     token = transaction_conn.set(proxy)
 
@@ -123,7 +169,6 @@ async def transaction():
         await proxy.rollback()
         raise
     finally:
-        # CRÍTICO: siempre resetear sin importar qué ocurrió arriba.
         transaction_conn.reset(token)
 
 
