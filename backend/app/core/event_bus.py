@@ -1,8 +1,10 @@
 # backend/app/core/event_bus.py
+
 import asyncio
 import inspect
 import fnmatch
-from typing import Type, Dict, List, Callable, Awaitable, Union, Any
+from typing import Type, Dict, List, Callable, Awaitable, Union, Any, Optional
+
 from app.core.events import Event
 from app.core.registry import Registry
 
@@ -11,83 +13,139 @@ EventHandler = Callable[[Any], Union[None, Awaitable[None]]]
 
 class EventBus:
     """
-    📡 SISTEMA NERVIOSO CENTRAL (Unified Event Bus)
-    Soporta:
-    - eventos de dominio por Clase
-    - señales del sistema por String
-    - wildcards estilo '*.created'
-    """
-    _instance = None
+    📡 SISTEMA NERVIOSO CENTRAL
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(EventBus, cls).__new__(cls)
-            cls._instance._subscribers = {}
-        return cls._instance
+    Reglas finales:
+    - Application crea y activa la instancia oficial
+    - módulos usan self.bus
+    - servicios sin acceso al runtime usan EventBus.get_instance()
+    - NO usar EventBus() directo como patrón de acceso
+    """
+
+    _active_instance: Optional["EventBus"] = None
+
+    def __init__(self):
+        self._subscribers: Dict[Union[Type[Event], str], List[EventHandler]] = {}
+
+    # =========================================================================
+    # CICLO DE VIDA
+    # =========================================================================
+
+    @classmethod
+    def get_instance(cls) -> "EventBus":
+        """
+        Devuelve la instancia activa de producción.
+        Si no existe, crea una temporal para tests/scripts.
+        """
+        if cls._active_instance is None:
+            cls._active_instance = cls()
+        return cls._active_instance
+
+    @classmethod
+    def set_active(cls, instance: "EventBus"):
+        cls._active_instance = instance
+
+    @classmethod
+    def clear_active(cls):
+        if cls._active_instance:
+            cls._active_instance.clear()
+        cls._active_instance = None
+
+    def clear(self) -> None:
+        self._subscribers = {}
+        print("   🧹 [EventBus] Todos los handlers limpiados.")
+
+    # =========================================================================
+    # SUBSCRIPCIÓN
+    # =========================================================================
 
     def subscribe(self, event_type: Union[Type[Event], str], handler: EventHandler) -> None:
+        """
+        Idempotente: no duplica el mismo handler.
+        """
         if event_type not in self._subscribers:
             self._subscribers[event_type] = []
 
-        if handler not in self._subscribers[event_type]:
-            self._subscribers[event_type].append(handler)
+        existing = self._subscribers[event_type]
+        handler_func = getattr(handler, "__wrapped__", handler)
+
+        for existing_handler in existing:
+            existing_func = getattr(existing_handler, "__wrapped__", existing_handler)
+            if existing_func is handler_func or existing_handler is handler:
+                return
+
+        existing.append(handler)
 
         name = getattr(event_type, "__name__", event_type)
         handler_name = getattr(handler, "__name__", handler.__class__.__name__)
         print(f"   👂 Bus: Handler '{handler_name}' suscrito a '{name}'")
 
-    def clear(self) -> None:
-        self._subscribers = {}
+    def unsubscribe(self, event_type: Union[Type[Event], str], handler: EventHandler) -> None:
+        handlers = self._subscribers.get(event_type, [])
+        if handler in handlers:
+            handlers.remove(handler)
+        if not handlers and event_type in self._subscribers:
+            del self._subscribers[event_type]
 
     def _get_string_handlers(self, event_name: str) -> List[EventHandler]:
         handlers: List[EventHandler] = []
         seen = set()
 
-        # exact match
+        # Coincidencia exacta
         for handler in self._subscribers.get(event_name, []):
-            if handler not in seen:
+            if id(handler) not in seen:
                 handlers.append(handler)
-                seen.add(handler)
+                seen.add(id(handler))
 
-        # wildcard matches
+        # Wildcards
         for key, key_handlers in self._subscribers.items():
             if isinstance(key, str) and ("*" in key or "?" in key or "[" in key):
                 if fnmatch.fnmatch(event_name, key):
                     for handler in key_handlers:
-                        if handler not in seen:
+                        if id(handler) not in seen:
                             handlers.append(handler)
-                            seen.add(handler)
+                            seen.add(id(handler))
 
         return handlers
 
+    # =========================================================================
+    # PUBLICACIÓN
+    # =========================================================================
+
     async def publish(self, event: Union[Event, str], **kwargs) -> None:
         """
-        Publica un evento y ejecuta sus handlers concurrentemente.
+        Publica un evento y ejecuta handlers concurrentemente.
+
+        Soporte:
+        - Event object -> handlers reciben el objeto
+        - String event  -> handlers reciben kwargs enriquecidos
+        - Wildcards     -> "*.created", "*.updated", etc.
         """
         if isinstance(event, Event):
             event_key = type(event)
             handlers = list(self._subscribers.get(event_key, []))
             payload_kwargs = kwargs
         else:
-            event_key = event
+            event_key = str(event)
             handlers = self._get_string_handlers(event_key)
 
             model_name = kwargs.get("model_name")
-            action = kwargs.get("action")
+            action_name = kwargs.get("action")
 
-            if isinstance(event_key, str) and "." in event_key:
+            # Enriquecimiento para eventos string estilo sale.order.updated
+            if "." in event_key:
                 parts = event_key.split(".")
                 if len(parts) >= 2:
                     inferred_action = parts[-1]
                     inferred_model = ".".join(parts[:-1])
                     model_name = model_name or inferred_model
-                    action = action or inferred_action
+                    action_name = action_name or inferred_action
 
             payload_kwargs = {
                 **kwargs,
                 "event_name": event_key,
                 "model_name": model_name,
-                "action": action,
+                "action": action_name,
             }
 
         if not handlers:
@@ -115,11 +173,14 @@ class EventBus:
                     print(f"🔥 Error asíncrono en ejecución de evento '{event_name_str}': {res}")
 
     # =========================================================================
-    # --- 🔥 MÉTODOS DE UI (Síncronos, usados durante la fase de Boot) ---
+    # METADATA DE UI
     # =========================================================================
 
     def publish_meta(self, module: str, icon: str, label: str) -> None:
         Registry.register_module(name=module, icon=icon, label=label)
 
-    def publish_menu(self, parent: str, action: str, label: str, sequence: int = 10) -> None:
-        Registry.register_menu(parent=parent, action=action, label=label, sequence=sequence)
+    def publish_menu(self, *args, **kwargs) -> None:
+        raise RuntimeError(
+            "❌ EventBus.publish_menu() está deshabilitado por arquitectura. "
+            "Usa ir.ui.menu persistido desde modules/<mod>/data/menus.py."
+        )

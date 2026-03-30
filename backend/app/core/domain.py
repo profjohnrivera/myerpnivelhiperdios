@@ -1,38 +1,74 @@
 # backend/app/core/domain.py
+# ============================================================
+# COMPILADOR DE DOMINIOS — ARQUITECTURA DEFINITIVA
+#
+# Traduce dominios estilo Odoo a SQL parametrizado.
+# Dos modos:
+#   compile_sql()  → SQL para PostgreSQL via asyncpg
+#   check()        → evaluación en RAM (para filtros in-memory)
+#
+# Soporte completo:
+#   - Operadores: =, !=, >, <, >=, <=, in, not in, like, ilike,
+#                 not like, not ilike, =?, child_of, parent_of
+#   - NULL semántico: ("field", "=", False/None) → IS NULL
+#                     ("field", "!=", False/None) → IS NOT NULL
+#   - Notación punto: ("order_id.create_uid", "=", 3) → LEFT JOIN
+#   - Operadores lógicos: & (AND), | (OR), ! (NOT)
+#   - AND implícito: lista de leaves sin operadores explícitos
+# ============================================================
+
 from typing import List, Tuple, Any, Dict, Union
+
+
+# Valor centinela para detectar NULL semántico en dominios Odoo.
+# En Odoo: ("field", "=", False) significa "campo es NULL o False".
+# En SQL: WHERE field IS NULL
+_NULL_SENTINELS = (None, False)
+
 
 class DomainEngine:
     """
-    🧠 EL COMPILADOR DE DOMINIOS (AST to SQL - Nivel HiperDios)
-    Evalúa en RAM (Fallback para UI) y Compila a SQL Crudo (WHERE + JOINs) en O(1).
+    🧠 EL COMPILADOR DE DOMINIOS (AST → SQL + RAM)
     """
+
+    # =========================================================================
+    # EVALUACIÓN EN RAM
+    # =========================================================================
 
     @staticmethod
     def _get_nested_value(record_instance: Any, field_path: str) -> Any:
-        parts = field_path.split('.')
+        parts = field_path.split(".")
         current_val = record_instance
         for part in parts:
             if hasattr(current_val, part):
-                try: current_val = getattr(current_val, part)
-                except ValueError: return None 
-            else: return None
-            if current_val is None: break
+                try:
+                    current_val = getattr(current_val, part)
+                except ValueError:
+                    return None
+            else:
+                return None
+            if current_val is None:
+                break
         return current_val
 
     @staticmethod
-    def _evaluate_leaf(leaf: Tuple, record_data: Dict[str, Any], record_instance: Any) -> bool:
-        """Evaluación en RAM (Legacy para @compute properties)"""
-        if len(leaf) != 3: return False
+    def _evaluate_leaf(
+        leaf: Tuple, record_data: Dict[str, Any], record_instance: Any = None
+    ) -> bool:
+        if len(leaf) != 3:
+            return False
+
         field, operator, value = leaf
-        
-        if '.' in field and record_instance:
+
+        if "." in field and record_instance:
             record_value = DomainEngine._get_nested_value(record_instance, field)
         else:
             record_value = record_data.get(field)
 
-        if hasattr(record_value, 'id'): record_value = record_value.id
+        if hasattr(record_value, "id"):
+            record_value = record_value.id
 
-        if field == 'id' or field.endswith('_id'):
+        if field == "id" or field.endswith("_id"):
             if isinstance(record_value, str) and record_value.isdigit():
                 record_value = int(record_value)
             if isinstance(value, str) and value.isdigit():
@@ -40,153 +76,307 @@ class DomainEngine:
             elif isinstance(value, (list, tuple, set)):
                 value = [int(v) if isinstance(v, str) and v.isdigit() else v for v in value]
 
-        if operator == '=': return record_value == value
-        elif operator == '!=': return record_value != value
-        elif operator in ('in', 'not in'):
-            if not isinstance(value, (list, tuple, set)): value = [value]
-            res = record_value in value
-            return res if operator == 'in' else not res
-        elif operator == '>': return record_value is not None and record_value > value
-        elif operator == '<': return record_value is not None and record_value < value
-        elif operator == '>=': return record_value is not None and record_value >= value
-        elif operator == '<=': return record_value is not None and record_value <= value
-        elif operator == 'ilike': 
-            return bool(record_value and str(value).lower() in str(record_value).lower())
-            
+        op = str(operator).lower()
+
+        if op == "=?":
+            return record_value in _NULL_SENTINELS or record_value == value
+
+        # NULL semántico en RAM: False/None significa "vacío"
+        if op == "=" and value in _NULL_SENTINELS:
+            return record_value in _NULL_SENTINELS
+        if op == "!=" and value in _NULL_SENTINELS:
+            return record_value not in _NULL_SENTINELS
+
+        if op == "=":
+            return record_value == value
+        if op == "!=":
+            return record_value != value
+        if op in ("in", "not in"):
+            if not isinstance(value, (list, tuple, set)):
+                value = [value]
+            result = record_value in value
+            return result if op == "in" else not result
+        if op == ">":
+            return record_value is not None and record_value > value
+        if op == "<":
+            return record_value is not None and record_value < value
+        if op == ">=":
+            return record_value is not None and record_value >= value
+        if op == "<=":
+            return record_value is not None and record_value <= value
+        if op in ("like", "ilike"):
+            if record_value is None:
+                return False
+            left, right = str(record_value), str(value)
+            return right.lower() in left.lower() if op == "ilike" else right in left
+        if op == "not ilike":
+            if record_value is None:
+                return True
+            return str(value).lower() not in str(record_value).lower()
+        if op == "not like":
+            if record_value is None:
+                return True
+            return str(value) not in str(record_value)
+
         return False
 
     @staticmethod
-    def check(record_data: Dict[str, Any], domain: List[Union[str, Tuple]], record_instance=None) -> bool:
-        """Fallback RAM (Se ejecuta para reglas locales o UI)"""
-        if not domain: return True
-        stack = []
+    def check(
+        record_data: Dict[str, Any],
+        domain: List[Union[str, Tuple]],
+        record_instance: Any = None,
+    ) -> bool:
+        """Evalúa un dominio en RAM. Soporta AND implícito y prefija."""
+        if not domain:
+            return True
+
+        has_ops = any(
+            isinstance(item, str) and item in ("&", "|", "!") for item in domain
+        )
+
+        if not has_ops:
+            return all(
+                DomainEngine._evaluate_leaf(item, record_data, record_instance)
+                for item in domain
+                if isinstance(item, (tuple, list))
+            )
+
+        stack: List[bool] = []
         for item in reversed(domain):
             if isinstance(item, str):
-                operator = item.upper()
-                if operator == '!':
-                    if stack: stack.append(not stack.pop())
-                elif operator in ('&', '|'):
-                    if len(stack) >= 2:
-                        left = stack.pop()
-                        right = stack.pop()
-                        result = (left and right) if operator == '&' else (left or right)
-                        stack.append(result)
+                op = item.upper()
+                if op == "!" and stack:
+                    stack.append(not stack.pop())
+                elif op in ("&", "|") and len(stack) >= 2:
+                    left, right = stack.pop(), stack.pop()
+                    stack.append((left and right) if op == "&" else (left or right))
             elif isinstance(item, (tuple, list)):
-                result = DomainEngine._evaluate_leaf(item, record_data, record_instance)
-                stack.append(result)
-        return all(stack)
+                stack.append(
+                    DomainEngine._evaluate_leaf(item, record_data, record_instance)
+                )
+
+        return all(stack) if stack else True
 
     # =========================================================================
-    # 💎 LA SOLUCIÓN HIPERDIOS: Compilador AST a SQL
+    # COMPILACIÓN A SQL
     # =========================================================================
+
     @staticmethod
-    def compile_sql(domain: List[Union[str, Tuple]], base_model: str) -> Tuple[str, str, List[Any]]:
+    def compile_sql(
+        domain: List[Union[str, Tuple]], base_model: str
+    ) -> Tuple[str, str, List[Any]]:
         """
-        Transforma Notación Polaca y Rutas con puntos ('company_id.name')
-        en sentencias nativas `LEFT JOIN` y `WHERE` para PostgreSQL.
-        Retorna: (joins_sql, where_sql, parameters)
+        Compila dominio Odoo a SQL parametrizado para asyncpg.
+
+        Retorna: (joins_sql, where_sql, params)
+
+        NULL SEMÁNTICO (estándar Odoo):
+          ("partner_id", "=", False)  → WHERE partner_id IS NULL
+          ("partner_id", "!=", False) → WHERE partner_id IS NOT NULL
+          ("partner_id", "=", None)   → WHERE partner_id IS NULL
+          ("partner_id", "!=", None)  → WHERE partner_id IS NOT NULL
+
+        Esto es correcto porque en PostgreSQL:
+          column = NULL  → siempre FALSE (SQL ternario)
+          column IS NULL → correcto
+        asyncpg no puede enviar NULL como parámetro para comparación =.
         """
         if not domain:
             return "", "", []
 
         from app.core.registry import Registry
 
-        joins = []
-        params = []
-        join_map = {} 
+        joins: List[str] = []
+        params: List[Any] = []
+        join_map: Dict[Tuple[str, str], str] = {}
         alias_counter = 0
 
-        def get_alias():
+        def get_alias() -> str:
             nonlocal alias_counter
             alias_counter += 1
             return f"t{alias_counter}"
 
+        def normalize_like(raw: Any) -> str:
+            s = str(raw or "")
+            return s if ("%" in s or "_" in s) else f"%{s}%"
+
         def process_leaf(leaf: Tuple) -> str:
-            if len(leaf) != 3: return "TRUE"
+            if len(leaf) != 3:
+                return "TRUE"
+
             field_path, op, value = leaf
-            
-            # 1. 🧬 Resolución de Auto-JOINs (Notación por puntos)
-            parts = field_path.split('.')
+            op_str = str(op).lower()
+
+            # =? → TRUE si value es NULL/vacío, sino trata como =
+            if op_str == "=?":
+                if value in _NULL_SENTINELS or value == "":
+                    return "TRUE"
+                op_str = "="
+
+            # --- Resolver ruta con notación punto (auto-JOINs) ---
+            parts = field_path.split(".")
             current_model = base_model
             current_alias = "t0"
 
-            for i in range(len(parts) - 1):
-                rel_field = parts[i]
-                fields_config = Registry.get_fields_for_model(current_model)
-                meta = fields_config.get(rel_field, {})
-                target_model = meta.get('target') or meta.get('relation')
-                
+            for rel_field in parts[:-1]:
+                fields_cfg = Registry.get_fields_for_model(current_model)
+                meta = fields_cfg.get(rel_field, {})
+                target_model = meta.get("target") or meta.get("relation")
                 if not target_model:
-                    raise ValueError(f"Domain Compiler Error: Relación '{rel_field}' no existe en '{current_model}'")
-                
+                    raise ValueError(
+                        f"Domain Compiler Error: Relación '{rel_field}' "
+                        f"no existe en '{current_model}'"
+                    )
                 join_key = (current_alias, rel_field)
                 if join_key not in join_map:
-                    new_alias = get_alias()
-                    join_map[join_key] = new_alias
+                    alias = get_alias()
+                    join_map[join_key] = alias
                     target_table = target_model.replace(".", "_")
-                    joins.append(f'LEFT JOIN "{target_table}" {new_alias} ON {current_alias}."{rel_field}" = {new_alias}.id')
-                
+                    joins.append(
+                        f'LEFT JOIN "{target_table}" {alias} '
+                        f'ON {current_alias}."{rel_field}" = {alias}.id'
+                    )
                 current_alias = join_map[join_key]
                 current_model = target_model
 
-            # 2. Resolución del campo terminal
             final_field = parts[-1]
-            fields_config = Registry.get_fields_for_model(current_model)
-            
-            sql_op = op.upper()
-            if sql_op == '=?': sql_op = 'ILIKE'
+            fields_cfg = Registry.get_fields_for_model(current_model)
+            is_native = final_field in fields_cfg or final_field == "id"
+            f_type = (
+                fields_cfg.get(final_field, {}).get("type")
+                if final_field != "id"
+                else "integer"
+            )
 
-            is_native = final_field in fields_config or final_field == 'id'
-            f_type = fields_config.get(final_field, {}).get('type') if final_field != 'id' else 'integer'
+            field_ref = (
+                f'{current_alias}."{final_field}"'
+                if is_native
+                else f"{current_alias}.x_ext->>'{final_field}'"
+            )
 
-            # 3. Limpieza de Tipos Segura
-            if f_type in ['relation', 'many2one', 'integer'] or final_field == 'id':
+            # ── NULL semántico (Odoo estándar) ────────────────────────────
+            # ("field", "=", False/None)  → IS NULL
+            # ("field", "!=", False/None) → IS NOT NULL
+            # No se puede enviar NULL como parámetro asyncpg para comparación =
+            if value in _NULL_SENTINELS and op_str in ("=", "!="):
+                return (
+                    f"{field_ref} IS NULL"
+                    if op_str == "="
+                    else f"{field_ref} IS NOT NULL"
+                )
+
+            # ── Normalización de tipos para columnas numéricas/relacionales ─
+            is_numeric = (
+                f_type in ("relation", "many2one", "integer", "int")
+                or final_field == "id"
+            )
+
+            if is_numeric:
                 if isinstance(value, (list, tuple, set)):
-                    value = [int(x) for x in value if str(x).isdigit()]
-                    if not value: return "FALSE" # Lista vacía en un IN genera falso instantáneo
+                    cleaned = [
+                        int(v) if isinstance(v, str) and v.isdigit() else v
+                        for v in value
+                        if isinstance(v, int) or (isinstance(v, str) and v.isdigit())
+                    ]
+                    value = cleaned
+                    if op_str in ("in", "not in") and not value:
+                        return "FALSE" if op_str == "in" else "TRUE"
                 elif isinstance(value, str) and value.isdigit():
                     value = int(value)
-                elif isinstance(value, str) and not value.isdigit() and op not in ['ilike', 'not ilike']:
-                    return "FALSE" # Bloqueo anti-crash: Intentaron igualar un texto a un BIGSERIAL
+                elif isinstance(value, str) and op_str not in (
+                    "like", "ilike", "not like", "not ilike"
+                ):
+                    # String no numérico para campo entero → nunca coincide
+                    return "FALSE"
+
+            # ── child_of / parent_of ─────────────────────────────────────
+            if op_str in ("child_of", "parent_of"):
+                if isinstance(value, (list, tuple, set)):
+                    value = [int(v) for v in value if str(v).isdigit()]
+                    if not value:
+                        return "FALSE"
+                    params.append(value)
+                    return f'{field_ref} = ANY(${len(params)}::bigint[])'
+                if isinstance(value, str) and value.isdigit():
+                    value = int(value)
+                params.append(value)
+                return f"{field_ref} = ${len(params)}"
+
+            # ── ILIKE / LIKE normalización ────────────────────────────────
+            if op_str in ("like", "ilike", "not like", "not ilike"):
+                value = normalize_like(value)
 
             params.append(value)
-            param_idx = len(params)
+            idx = len(params)
 
-            # 4. Construcción del SQL Crudo
-            if is_native:
-                field_ref = f'{current_alias}."{final_field}"'
-                cast_type = "bigint[]" if f_type in ['relation', 'many2one', 'integer'] or final_field == 'id' else "text[]"
-                
-                if sql_op in ('IN', 'NOT IN'):
-                    if not isinstance(value, (list, tuple, set)): params[-1] = [value]
-                    op_str = "= ANY" if sql_op == 'IN' else "!= ALL"
-                    return f"{field_ref} {op_str}(${param_idx}::{cast_type})"
-                else:
-                    return f"{field_ref} {sql_op} ${param_idx}"
-            else:
-                # Inyección JSONB
-                field_ref = f"{current_alias}.x_ext->>'{final_field}'"
-                params[-1] = str(value) 
-                return f"{field_ref} {sql_op} ${param_idx}"
+            # ── Operadores de comparación simples ─────────────────────────
+            if op_str == "=":
+                return f"{field_ref} = ${idx}"
+            if op_str == "!=":
+                return f"{field_ref} != ${idx}"
+            if op_str == ">":
+                return f"{field_ref} > ${idx}"
+            if op_str == "<":
+                return f"{field_ref} < ${idx}"
+            if op_str == ">=":
+                return f"{field_ref} >= ${idx}"
+            if op_str == "<=":
+                return f"{field_ref} <= ${idx}"
 
-        # 5. Máquina de Pila (Algoritmo de Prioridad Inversa)
-        stack = []
+            # ── IN / NOT IN ───────────────────────────────────────────────
+            if op_str in ("in", "not in"):
+                cast = (
+                    "bigint[]"
+                    if is_numeric
+                    else "text[]"
+                )
+                if not isinstance(value, (list, tuple, set)):
+                    params[-1] = [value]
+                return (
+                    f"{field_ref} = ANY(${idx}::{cast})"
+                    if op_str == "in"
+                    else f"{field_ref} != ALL(${idx}::{cast})"
+                )
+
+            # ── LIKE variants ─────────────────────────────────────────────
+            if op_str == "like":
+                return f"{field_ref} LIKE ${idx}"
+            if op_str == "ilike":
+                return f"{field_ref} ILIKE ${idx}"
+            if op_str == "not like":
+                return f"{field_ref} NOT LIKE ${idx}"
+            if op_str == "not ilike":
+                return f"{field_ref} NOT ILIKE ${idx}"
+
+            raise ValueError(f"Operador de dominio no soportado: '{op}'")
+
+        # ── Compilación del árbol de dominio ─────────────────────────────
+        has_explicit_ops = any(
+            isinstance(item, str) and item in ("&", "|", "!") for item in domain
+        )
+
+        if not has_explicit_ops:
+            # AND implícito entre todos los leaves
+            leaves_sql = [
+                process_leaf(item)
+                for item in domain
+                if isinstance(item, (tuple, list))
+            ]
+            return " ".join(joins), " AND ".join(leaves_sql), params
+
+        # Notación prefija Odoo (Polish notation): recorrido inverso
+        stack: List[str] = []
         for item in reversed(domain):
             if isinstance(item, str):
-                operator = item.upper()
-                if operator == '!':
-                    if stack: stack.append(f"(NOT {stack.pop()})")
-                elif operator in ('&', '|'):
-                    if len(stack) >= 2:
-                        left = stack.pop()
-                        right = stack.pop()
-                        sql_log_op = "AND" if operator == '&' else "OR"
-                        stack.append(f"({left} {sql_log_op} {right})")
+                op = item.upper()
+                if op == "!" and stack:
+                    stack.append(f"(NOT {stack.pop()})")
+                elif op in ("&", "|") and len(stack) >= 2:
+                    left, right = stack.pop(), stack.pop()
+                    sql_op = "AND" if op == "&" else "OR"
+                    stack.append(f"({left} {sql_op} {right})")
             elif isinstance(item, (tuple, list)):
                 stack.append(process_leaf(item))
 
-        # Los dominios Odoo tienen un 'AND' implícito para los remanentes de la pila
-        where_clause = " AND ".join(reversed(stack))
-        joins_clause = " ".join(joins)
-
-        return joins_clause, where_clause, params
+        where = " AND ".join(reversed(stack))
+        return " ".join(joins), where, params

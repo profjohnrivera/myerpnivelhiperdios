@@ -1,4 +1,6 @@
 # backend/app/core/application.py
+
+import os
 from typing import Any, List, Type
 
 from app.core.event_bus import EventBus
@@ -7,46 +9,97 @@ from app.core.kernel import Kernel
 from app.core.storage.postgres_storage import PostgresGraphStorage
 
 
-class Application:
-    """
-    Orquestador maestro.
-    """
+def _validate_production_secrets():
+    secret_key = os.getenv("ERP_SECRET_KEY", "DEV_ONLY_CHANGE_ME_HIPERDIOS")
+    db_password = os.getenv("ERP_DB_PASSWORD", "1234")
+    env_mode = os.getenv("ERP_ENV", "development")
 
+    if env_mode == "production":
+        errors = []
+
+        if "DEV_ONLY" in secret_key or secret_key == "DEV_ONLY_CHANGE_ME_HIPERDIOS":
+            errors.append(
+                "❌ ERP_SECRET_KEY tiene el valor por defecto de desarrollo. "
+                "Define una clave segura de al menos 32 caracteres."
+            )
+
+        if db_password in ("1234", "postgres", "password", "admin", ""):
+            errors.append(
+                "❌ ERP_DB_PASSWORD tiene una contraseña trivial. "
+                "Define una contraseña segura para la base de datos."
+            )
+
+        if errors:
+            raise RuntimeError(
+                "\n🛑 ARRANQUE BLOQUEADO — Credenciales inseguras detectadas:\n"
+                + "\n".join(errors)
+                + "\n\nDefine las variables de entorno correctas o cambia ERP_ENV a 'development'."
+            )
+    else:
+        if "DEV_ONLY" in secret_key:
+            print("⚠️  [SECURITY] ERP_SECRET_KEY usa el valor de desarrollo. NO usar en producción.")
+        if db_password in ("1234", "postgres", "password", "admin"):
+            print("⚠️  [SECURITY] ERP_DB_PASSWORD usa una contraseña débil. NO usar en producción.")
+
+
+class Application:
     def __init__(self) -> None:
+        _validate_production_secrets()
+
+        # Instancia oficial del bus
         self.bus = EventBus()
+        EventBus.set_active(self.bus)
+
         self.storage = PostgresGraphStorage()
+
         self.graph = Graph()
         self.graph.set_loader(self.storage.load_context)
+
         self.kernel = Kernel(bus=self.bus, graph=self.graph)
 
     async def boot(self, modules: List[Type]) -> None:
         print("🔌 Application: Initializing infrastructure...")
 
-        # 1. Infra mínima: conexión/pool
         await self.storage.get_pool()
-
-        # 2. Carga constitucional del kernel
         self.kernel.load_modules(modules)
-
-        # 3. Registry cerrado + schema + metadata técnica
         await self.kernel.prepare()
 
-        # 4. Recién ahora restauramos memoria persistida
-        await self._restore_graph_state()
-
-        # 5. Cargar data y vistas
+        await self._warm_up_system_config()
         await self.kernel.load_data()
-
-        # 6. Poner módulos y servicios online
         await self.kernel.boot()
 
-    async def _restore_graph_state(self):
-        print("🧠 Restoring persisted graph state...")
-        saved_graph = await self.storage.load()
-        if saved_graph:
-            self.graph._values = saved_graph._values
-            self.graph._versions = saved_graph._versions
-            print("   ✅ Graph state restored.")
+    async def _warm_up_system_config(self):
+        """
+        Carga SOLO ir.config_parameter en el graph maestro.
+        """
+        try:
+            storage = PostgresGraphStorage()
+            conn_or_pool = await storage.get_connection()
+            query = 'SELECT * FROM "ir_config_parameter" LIMIT 500'
+
+            try:
+                if hasattr(conn_or_pool, "acquire"):
+                    async with conn_or_pool.acquire() as conn:
+                        rows = await conn.fetch(query)
+                else:
+                    rows = await conn_or_pool.fetch(query)
+
+                for row in rows:
+                    rec_id = row["id"]
+                    for col, val in row.items():
+                        if col == "id":
+                            continue
+                        key = ("ir.config_parameter", rec_id, col)
+                        self.graph._values[key] = storage._parse_db_value(val)
+                        self.graph._versions[key] = 1
+
+                print(f"   ✅ Sistema: {len(rows)} parámetros de configuración cargados en memoria.")
+
+            except Exception:
+                print("   ℹ️  ir_config_parameter aún no existe, se creará en prepare().")
+
+        except Exception as e:
+            print(f"   ⚠️  Warm-up de configuración omitido: {e}")
 
     async def emit(self, event: Any) -> None:
         try:
@@ -59,7 +112,10 @@ class Application:
     async def shutdown(self) -> None:
         print("🔌 Application: Initiating graceful shutdown...")
         await self.kernel.shutdown()
+
         pool = getattr(self.storage, "_conn_pool", None)
         if pool:
             await pool.close()
+
+        EventBus.clear_active()
         print("🔌 Application: Offline.")

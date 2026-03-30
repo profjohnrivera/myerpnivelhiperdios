@@ -1,4 +1,5 @@
 # backend/modules/core_base/models/res_users.py
+
 from app.core.orm import Model, Field, RelationField, Many2manyField
 from app.core.security import hash_password, verify_password, is_password_hash
 
@@ -6,6 +7,11 @@ from app.core.security import hash_password, verify_password, is_password_hash
 class ResUsers(Model):
     """
     👤 USUARIOS DEL SISTEMA (HiperDios Core)
+    Inspirado en el patrón de Odoo:
+    - usuario vinculado a partner
+    - grupos many2many
+    - login normalizado
+    - password siempre hasheado
     """
     _name = "res.users"
     _rec_name = "name"
@@ -29,7 +35,7 @@ class ResUsers(Model):
         return (login or "").strip().lower()
 
     @classmethod
-    async def create(cls, vals: dict, context=None):
+    async def _prepare_create_vals(cls, vals: dict, context=None) -> dict:
         vals = dict(vals or {})
 
         if "login" in vals:
@@ -41,7 +47,6 @@ class ResUsers(Model):
             if not is_password_hash(vals["password"]):
                 vals["password"] = await hash_password(vals["password"])
 
-        # Auto-creación de partner si no viene
         if not vals.get("partner_id"):
             from app.core.env import Context
 
@@ -57,7 +62,67 @@ class ResUsers(Model):
                 partner = await Partner.create(partner_vals, context=context)
                 vals["partner_id"] = partner.id
 
-        return await super().create(vals, context=context)
+        return vals
+
+    @classmethod
+    async def _get_default_group_id(cls) -> int | None:
+        """
+        Devuelve el ID del grupo "Ventas / Usuario" (grupo base de todos los usuarios).
+        Equivalente al base.group_user de Odoo — todo usuario autenticado pertenece a él.
+        Esto garantiza que:
+          1. Los ACL de negocio (product.product, sale.order, res.partner) apliquen.
+          2. Las reglas RLS (ir.rule) filtren los datos correctamente.
+          3. Los menús con group_ids se muestren al usuario.
+        """
+        try:
+            from app.core.registry import Registry
+            from app.core.env import Context
+            env = Context.get_env()
+            if not env:
+                return None
+            ResGroups = Registry.get_model("res.groups")
+            if not ResGroups:
+                return None
+            groups = await ResGroups.search([("name", "=", "Ventas / Usuario")], limit=1)
+            if groups:
+                return groups[0].id
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    async def create(cls, vals: dict, context=None):
+        vals = await cls._prepare_create_vals(vals, context=context)
+        record = await super().create(vals, context=context)
+
+        # AUTO-ASIGNACIÓN DE GRUPO BASE (como base.group_user en Odoo)
+        # Todo usuario recibe el grupo "Ventas / Usuario" automáticamente al crearse.
+        # Esto garantiza ACL + RLS correctos desde el primer login.
+        # Los admins también lo reciben (tienen bypass por is_system_admin=True).
+        try:
+            default_group_id = await cls._get_default_group_id()
+            if default_group_id:
+                current_groups = getattr(record, "group_ids", None)
+                if current_groups is None:
+                    current_groups = []
+                try:
+                    current_groups = list(current_groups)
+                except Exception:
+                    current_groups = []
+
+                group_ids_normalized = []
+                for g in current_groups:
+                    if isinstance(g, (int, float)):
+                        group_ids_normalized.append(int(g))
+                    elif hasattr(g, "id"):
+                        group_ids_normalized.append(int(g.id))
+
+                if default_group_id not in group_ids_normalized:
+                    await record.write({"group_ids": group_ids_normalized + [default_group_id]})
+        except Exception:
+            pass  # Nunca bloquear la creación de usuario por fallo de grupo
+
+        return record
 
     async def write(self, vals: dict):
         vals = dict(vals or {})
@@ -73,7 +138,6 @@ class ResUsers(Model):
 
         result = await super().write(vals)
 
-        # Sincronización ligera con partner
         try:
             if self.partner_id:
                 partner_updates = {}
@@ -90,9 +154,6 @@ class ResUsers(Model):
         return result
 
     async def _check_credentials(self, password: str) -> bool:
-        """
-        Valida la contraseña del usuario instanciado.
-        """
         if not self.active:
             raise PermissionError("Usuario desactivado.")
 

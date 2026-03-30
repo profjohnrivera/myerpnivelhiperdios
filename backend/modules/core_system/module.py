@@ -1,11 +1,12 @@
 # backend/modules/core_system/module.py
+
 from app.core.module import Module
 
 from modules.core_system.models.ir_model import IrModel
 from modules.core_system.models.ir_model_fields import IrModelFields
 from modules.core_system.models.ir_sequence import IrSequence
 from modules.core_system.models.ir_rule import IrRule
-from modules.core_system.models.ir_audit import IrAuditLog
+from modules.core_system.models.ir_audit_log import IrAuditLog
 from modules.core_system.models.ir_module import IrModule, IrModuleDependency
 from modules.core_system.models.ir_model_data import IrModelData
 from modules.core_system.models.ir_actions import IrActionActWindow, IrActionServer
@@ -44,13 +45,13 @@ class CoreSystemModule(Module):
         )
 
     async def boot(self):
-        from app.core.event_bus import EventBus
-
-        bus = EventBus()
-
+        """
+        Usa el bus inyectado por Application/Kernel.
+        NO fabrica otro EventBus.
+        """
         try:
             from modules.core_system.services.sequence_service import on_sequence_created
-            bus.subscribe("SequenceCreated", on_sequence_created)
+            self.bus.subscribe("SequenceCreated", on_sequence_created)
         except Exception:
             pass
 

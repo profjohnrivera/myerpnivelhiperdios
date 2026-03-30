@@ -1,4 +1,5 @@
 # backend/fix_db.py
+
 import asyncio
 
 from app.core.application import Application
@@ -23,7 +24,7 @@ async def reset_db():
     modules = discover_modules("modules")
     await app.boot(modules)
 
-    # Entorno técnico del sembrado: sin auditoría y con privilegios de sistema
+    # Entorno técnico del sembrado
     env_system = Env(
         user_id="system",
         graph=app.graph,
@@ -60,13 +61,16 @@ async def reset_db():
     r_ventas_id = id_map.get(str(role_ventas.id), role_ventas.id)
     r_gerencia_id = id_map.get(str(role_gerencia.id), role_gerencia.id)
 
-    sale_models = await IrModel.search([("model", "=", "sale.order")])
-    partner_models = await IrModel.search([("model", "=", "res.partner")])
+    sale_models = await IrModel.search([("model", "=", "sale.order")], limit=1)
+    sale_line_models = await IrModel.search([("model", "=", "sale.order.line")], limit=1)
+    partner_models = await IrModel.search([("model", "=", "res.partner")], limit=1)
 
     sale_model_id = sale_models[0].id if sale_models else None
+    sale_line_model_id = sale_line_models[0].id if sale_line_models else None
     partner_model_id = partner_models[0].id if partner_models else None
 
-    if sale_model_id and partner_model_id:
+    # Vendedores
+    if sale_model_id:
         await IrModelAccess.create({
             "name": "Vendedores - Ventas",
             "model_id": sale_model_id,
@@ -76,6 +80,19 @@ async def reset_db():
             "perm_create": True,
             "perm_unlink": False,
         })
+
+    if sale_line_model_id:
+        await IrModelAccess.create({
+            "name": "Vendedores - Líneas de Venta",
+            "model_id": sale_line_model_id,
+            "group_id": r_ventas_id,
+            "perm_read": True,
+            "perm_write": True,
+            "perm_create": True,
+            "perm_unlink": False,
+        })
+
+    if partner_model_id:
         await IrModelAccess.create({
             "name": "Vendedores - Clientes",
             "model_id": partner_model_id,
@@ -85,6 +102,9 @@ async def reset_db():
             "perm_create": False,
             "perm_unlink": False,
         })
+
+    # Gerencia
+    if sale_model_id:
         await IrModelAccess.create({
             "name": "Gerencia - Ventas Totales",
             "model_id": sale_model_id,
@@ -95,17 +115,29 @@ async def reset_db():
             "perm_unlink": True,
         })
 
-        all_models = await IrModel.search([])
-        for m in all_models:
-            await IrModelAccess.create({
-                "name": f"Admin - {m.model}",
-                "model_id": m.id,
-                "group_id": r_admin_id,
-                "perm_read": True,
-                "perm_write": True,
-                "perm_create": True,
-                "perm_unlink": True,
-            })
+    if sale_line_model_id:
+        await IrModelAccess.create({
+            "name": "Gerencia - Líneas de Venta",
+            "model_id": sale_line_model_id,
+            "group_id": r_gerencia_id,
+            "perm_read": True,
+            "perm_write": True,
+            "perm_create": True,
+            "perm_unlink": True,
+        })
+
+    # Admin full
+    all_models = await IrModel.search([])
+    for m in all_models:
+        await IrModelAccess.create({
+            "name": f"Admin - {m.model}",
+            "model_id": m.id,
+            "group_id": r_admin_id,
+            "perm_read": True,
+            "perm_write": True,
+            "perm_create": True,
+            "perm_unlink": True,
+        })
 
     await app.storage.save(app.graph)
 
@@ -146,10 +178,19 @@ async def reset_db():
     # ==========================================================
     print("\n--- 🛡️ Creando Privacidad de Filas (RLS) ---")
     IrRule = env_system["ir.rule"]
+
+    # Pedido: cada vendedor ve sus propios pedidos
     await IrRule.create({
         "name": "Privacidad de Ventas (Solo mis pedidos)",
         "model_name": "sale.order",
         "domain_force": '[["create_uid", "=", "{user_id}"]]',
+    })
+
+    # Línea: cada vendedor ve las líneas de pedidos creados por él
+    await IrRule.create({
+        "name": "Privacidad de Líneas de Venta (Solo líneas de mis pedidos)",
+        "model_name": "sale.order.line",
+        "domain_force": '[["order_id.create_uid", "=", "{user_id}"]]',
     })
 
     await app.storage.save(app.graph)
@@ -164,7 +205,6 @@ async def reset_db():
     id_map = await app.storage.save(app.graph)
     c1_id = id_map.get(str(cliente1.id), cliente1.id)
 
-    # El vendedor Alpha crea su pedido
     env_alpha = Env(
         user_id=alpha_id,
         graph=app.graph,
@@ -176,7 +216,6 @@ async def reset_db():
     })
     print("      ✅ [Alpha] Pedido creado exitosamente.")
 
-    # El gerente Beta crea su pedido
     env_beta = Env(
         user_id=beta_id,
         graph=app.graph,

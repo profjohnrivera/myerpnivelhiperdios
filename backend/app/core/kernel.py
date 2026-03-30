@@ -1,11 +1,13 @@
 # backend/app/core/kernel.py
+
 import asyncio
 import importlib
+import inspect
 import pkgutil
 import traceback
 from typing import Any, Dict, List, Optional, Type
 
-from app.core.env import Env
+from app.core.env import Env, Context
 from app.core.event_bus import EventBus
 from app.core.graph import Graph
 from app.core.orm import Model
@@ -16,6 +18,11 @@ from app.core.worker import WorkerEngine
 class Kernel:
     """
     Constitución única del núcleo.
+
+    REGLA OFICIAL DE A6:
+    - Kernel es la ÚNICA vía de carga de modules/*/data
+    - DataIngestor ya no ejecuta bootstrap real
+    - Todo init_* corre aquí, con Env de sistema y Context restaurado
     """
 
     def __init__(self, bus: Optional[EventBus] = None, graph: Optional[Graph] = None) -> None:
@@ -64,7 +71,6 @@ class Kernel:
         if not self.modules:
             raise RuntimeError("❌ No hay módulos cargados en el kernel.")
 
-        # Garantía fundacional antes del freeze/sync
         self._ensure_foundational_models()
 
         Registry.freeze()
@@ -111,7 +117,7 @@ class Kernel:
                     await module.boot()
                 else:
                     result = module.boot()
-                    if asyncio.iscoroutine(result):
+                    if inspect.isawaitable(result):
                         await result
                 print(f"   ✅ {mod_name} is online.")
             except Exception:
@@ -119,7 +125,6 @@ class Kernel:
                 print(traceback.format_exc())
                 raise
 
-        # Servicios al final, cuando el schema ya existe
         from app.core.auditor import AuditService
         await AuditService.bootstrap()
         asyncio.create_task(WorkerEngine.run())
@@ -138,7 +143,7 @@ class Kernel:
                         await module.shutdown()
                     else:
                         result = module.shutdown()
-                        if asyncio.iscoroutine(result):
+                        if inspect.isawaitable(result):
                             await result
             except Exception:
                 print(f"⚠️ Error during shutdown of module '{mod_name}'")
@@ -187,7 +192,8 @@ class Kernel:
             raise RuntimeError(f"❌ Error importando {full_package_path}: {e}") from e
 
         if hasattr(package, "__path__"):
-            for _, name, _ in pkgutil.iter_modules(package.__path__):
+            children = sorted(pkgutil.iter_modules(package.__path__), key=lambda x: x[1])
+            for _, name, _ in children:
                 child_module = f"{full_package_path}.{name}"
                 try:
                     importlib.import_module(child_module)
@@ -202,9 +208,6 @@ class Kernel:
         antes de freeze/sync/init_data.
         """
 
-        # =========================
-        # CORE BASE
-        # =========================
         if "core_base" in self.modules:
             try:
                 from modules.core_base.models.res_partner import ResPartner
@@ -227,9 +230,6 @@ class Kernel:
                 except Exception:
                     Registry.register_model(model_cls, owner_module="core_base")
 
-        # =========================
-        # CORE SYSTEM
-        # =========================
         if "core_system" in self.modules:
             try:
                 from modules.core_system.models.ir_model import IrModel
@@ -270,7 +270,36 @@ class Kernel:
                 except Exception:
                     Registry.register_model(model_cls, owner_module="core_system")
 
+    async def _run_maybe_async(self, func, *args, **kwargs):
+        """
+        Ejecuta callables sync/async sin duplicar lógica.
+        """
+        if asyncio.iscoroutinefunction(func):
+            return await func(*args, **kwargs)
+
+        result = func(*args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _execute_with_system_env(self, func, *args, **kwargs):
+        """
+        Activa un Env técnico temporal y RESTAURA el Context al salir.
+        """
+        env = Env(user_id="system", graph=self.graph)
+        token = Context.set_env(env)
+        try:
+            return await self._run_maybe_async(func, env, *args, **kwargs)
+        finally:
+            Context.restore(token)
+
     async def _execute_init_data(self, module_name: str):
+        """
+        Pipeline oficial y único de carga de data de módulos.
+        Recorre modules.<mod>.data y ejecuta:
+        - submódulos *.py con funciones init_*
+        - opcionalmente init_data() en el package
+        """
         data_package_path = f"modules.{module_name}.data"
 
         try:
@@ -280,30 +309,28 @@ class Kernel:
                 return
             raise RuntimeError(f"❌ Error importando {data_package_path}: {e}") from e
 
-        env = Env(user_id="system", graph=self.graph)
+        async def _runner(env: Env):
+            if hasattr(data_package, "__path__"):
+                children = sorted(pkgutil.iter_modules(data_package.__path__), key=lambda x: x[1])
+                for _, sub_name, _ in children:
+                    sub_mod_path = f"{data_package_path}.{sub_name}"
+                    sub_mod = importlib.import_module(sub_mod_path)
 
-        if hasattr(data_package, "__path__"):
-            for _, sub_name, _ in pkgutil.iter_modules(data_package.__path__):
-                sub_mod = importlib.import_module(f"{data_package_path}.{sub_name}")
-                for func_name in dir(sub_mod):
-                    if func_name.startswith("init_"):
+                    init_funcs = sorted(
+                        [func_name for func_name in dir(sub_mod) if func_name.startswith("init_")]
+                    )
+
+                    for func_name in init_funcs:
                         func = getattr(sub_mod, func_name)
-                        print(f"   💿 [INGESTOR] {module_name} -> {sub_name}.{func_name}")
-                        if asyncio.iscoroutinefunction(func):
-                            await func(env)
-                        else:
-                            result = func(env)
-                            if asyncio.iscoroutine(result):
-                                await result
+                        print(f"   💿 [DATA] {module_name} -> {sub_name}.{func_name}")
+                        await self._run_maybe_async(func, env)
 
-        if hasattr(data_package, "init_data"):
-            func = getattr(data_package, "init_data")
-            if asyncio.iscoroutinefunction(func):
-                await func(env)
-            else:
-                result = func(env)
-                if asyncio.iscoroutine(result):
-                    await result
+            package_init = getattr(data_package, "init_data", None)
+            if package_init:
+                print(f"   💿 [DATA] {module_name} -> __init__.init_data")
+                await self._run_maybe_async(package_init, env)
+
+        await self._execute_with_system_env(_runner)
 
     async def _sync_registry_metadata(self):
         """
@@ -312,30 +339,27 @@ class Kernel:
         try:
             sync_mod = importlib.import_module("modules.core_system.data.registry_sync")
             sync_func = getattr(sync_mod, "sync_models_and_fields", None)
-            if sync_func:
-                env = Env(user_id="system", graph=self.graph)
-                if asyncio.iscoroutinefunction(sync_func):
-                    await sync_func(env)
-                else:
-                    result = sync_func(env)
-                    if asyncio.iscoroutine(result):
-                        await result
+            if not sync_func:
+                return
+
+            await self._execute_with_system_env(sync_func)
         except ModuleNotFoundError:
             return
 
     async def _sync_module_records(self):
-        try:
-            IrModule = Registry.get_model("ir.module")
-            Env(user_id="system", graph=self.graph)
+        async def _runner(env: Env):
+            try:
+                IrModule = Registry.get_model("ir.module")
+                for mod_name in self._module_order:
+                    existing = await IrModule.search([("name", "=", mod_name)])
+                    if not existing:
+                        await IrModule.create({
+                            "name": mod_name,
+                            "state": "installed",
+                            "shortdesc": mod_name.replace("_", " ").title(),
+                            "version": "1.0.0",
+                        })
+            except Exception as e:
+                print(f"⚠️ Module sync skipped: {e}")
 
-            for mod_name in self._module_order:
-                existing = await IrModule.search([("name", "=", mod_name)])
-                if not existing:
-                    await IrModule.create({
-                        "name": mod_name,
-                        "state": "installed",
-                        "shortdesc": mod_name.replace("_", " ").title(),
-                        "version": "1.0.0",
-                    })
-        except Exception as e:
-            print(f"⚠️ Module sync skipped: {e}")
+        await self._execute_with_system_env(_runner)

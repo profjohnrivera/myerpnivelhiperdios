@@ -151,7 +151,6 @@ export const ModelPlayer: React.FC = () => {
   };
 
   const handleAction = async (actionName: string, params: any = {}) => {
-    // Orquestación Genérica de Rutas Frontend (CRUD Local)
     if (actionName === 'new_record') return navigate(`/app/${modelName}/form`); 
     if (actionName === 'open_record') return navigate(`/app/${modelName}/form/${params.id}`); 
     if (actionName === 'back' || actionName === 'discard') {
@@ -161,7 +160,6 @@ export const ModelPlayer: React.FC = () => {
     if (actionName === 'search_relation') return setLookupConfig(params);
     if (actionName === 'search_records') return refresh(params);
     
-    // Operaciones en Tablas Relacionales
     if (actionName === 'add_line') {
       const fieldName = params.field;
       const currentLines = Array.isArray(data[fieldName]) ? [...data[fieldName]] : [];
@@ -186,7 +184,6 @@ export const ModelPlayer: React.FC = () => {
       return;
     }
 
-    // Clonación Genérica
     if (actionName === 'duplicate') {
        if (window.confirm("¿Deseas duplicar este registro?")) {
           const payloadToSave = sanitizePayload(data);
@@ -202,7 +199,6 @@ export const ModelPlayer: React.FC = () => {
              }
           });
 
-          // ⚡ Cero lógica de negocio. Lo que falte lo grita la BD.
           try {
              const res = await api.post(`/data/${modelName}/create`, payloadToSave);
              if (res.data && res.data.data && res.data.data.id) {
@@ -213,11 +209,9 @@ export const ModelPlayer: React.FC = () => {
        return;
     }
 
-    // Guardado Genérico
     const performSave = async () => {
       const payloadToSave = sanitizePayload(data); 
       
-      // ⚡ Cero inyección de defaults por modelo. Eso ocurre en el backend.
       const endpoint = data?.id ? `/data/${modelName}/${data.id}/write` : `/data/${modelName}/create`; 
       const res = await api.post(endpoint, payloadToSave);
       if (res.data && res.data.status === 'error') throw new Error(res.data.detail);
@@ -239,9 +233,6 @@ export const ModelPlayer: React.FC = () => {
       return;
     }
 
-    // ========================================================================
-    // 🚀 EJECUCIÓN DE ACCIONES (Disparo hacia FastAPI)
-    // ========================================================================
     try {
       const saveResult = await performSave();
       const finalRecordId = saveResult?.data?.id || data?.id || id;
@@ -286,7 +277,6 @@ export const ModelPlayer: React.FC = () => {
     }
   };
 
-  // 💎 INTERCEPTOR GLOBAL PARA BOTONES HUÉRFANOS (Bypass de RenderComponent)
   useEffect(() => {
     const interceptor = (e: any) => {
         if (e.detail?.action) {
@@ -295,10 +285,10 @@ export const ModelPlayer: React.FC = () => {
     };
     window.addEventListener('sdui_orphan_action', interceptor);
     return () => window.removeEventListener('sdui_orphan_action', interceptor);
-  }, [data, id]); // Dependencias para que siempre tenga la data fresca
+  }, [data, id]);
 
   if (loading) return (
-    <div className="flex-1 flex flex-col items-center justify-center bg-white min-h-screen w-full">
+    <div className="flex-1 flex flex-col items-center justify-center bg-transparent min-h-screen w-full">
         <Icons.Loader2 size={40} className="animate-spin text-[#714B67] mb-4" />
         <span className="text-[#6b7280] text-[14px]">Cargando...</span>
     </div>
@@ -306,7 +296,7 @@ export const ModelPlayer: React.FC = () => {
 
   const currentId = data?.id || id;
   if (currentId === 'new') return (
-      <div className="flex flex-col items-center justify-center h-screen w-full bg-[#f9fafb]">
+      <div className="flex flex-col items-center justify-center h-screen w-full bg-transparent">
           <Icons.Loader2 size={40} className="animate-spin text-[#714B67] mb-4" />
       </div>
   );
@@ -340,15 +330,18 @@ export const ModelPlayer: React.FC = () => {
             />
         </div>
       )}
+      
+      {/* 🚀 FIX 1: bg-transparent cuando NO es form para dejar pasar el gris. */}
       <div className={`flex-1 overflow-y-auto odoo-scrollbar w-full animate-in fade-in duration-300 ${
-          viewType === 'form' ? 'bg-[#F9FAFB] p-0 md:p-6 pb-24' : 'bg-white p-0'
+          viewType === 'form' ? 'bg-[#F9FAFB] p-0 md:p-6 pb-24' : 'bg-transparent p-0'
       }`}>
+         {/* 🚀 FIX 2: bg-transparent en vistas genericas (como lista). 
+             Y para form view: Odoo 20 es flat, así que cambié shadow-[0_1px_3px_rgba(0,0,0,0.1)] por shadow-none y un borde del color exacto de odoo */}
          <div className={
             viewType === 'form' 
-            ? "w-full md:max-w-[1140px] md:mx-auto bg-white md:rounded-[4px] md:shadow-[0_1px_3px_rgba(0,0,0,0.1)] md:border border-[#e5e7eb] min-h-full md:min-h-0" 
-            : "w-full h-full bg-white"
+            ? "w-full md:max-w-[1140px] md:mx-auto bg-white md:rounded-[4px] md:shadow-none md:border border-[#d8dadd] min-h-full md:min-h-0" 
+            : "w-full h-full bg-transparent"
          }>
-            {/* 🚀 EL ESCUDO DE LAZY LOADING (Suspense) SE AÑADE AQUÍ */}
             {schema && (
                <React.Suspense fallback={<div className="p-10 flex flex-col items-center justify-center text-[#9ca3af] animate-pulse"><Icons.Loader2 size={24} className="animate-spin text-[#714B67] mb-2"/><span>Ensamblando vista...</span></div>}>
                    <RenderComponent schema={schema} data={data} onUpdate={handleStateUpdate} onAction={handleAction} />
@@ -356,6 +349,7 @@ export const ModelPlayer: React.FC = () => {
             )}
          </div>
       </div>
+      
       {lookupConfig && (
         <SearchModal config={lookupConfig} onClose={() => setLookupConfig(null)} onSelect={(selectedId, selectedName) => { handleStateUpdate(lookupConfig.field, [selectedId, selectedName]); setLookupConfig(null); }} />
       )}

@@ -45,19 +45,42 @@ export const AsyncMany2one = ({ value, onChange, placeholder = "Comience a escri
   useOnClickOutside(ref, () => setIsOpen(false));
   useEffect(() => { if (!resetOnSelect) setSearchTerm(value || ''); }, [value, resetOnSelect]);
 
+  // 🚀 Carga instantánea (Zero-Lag) y Búsqueda con Spinner (Debounce 300ms)
   useEffect(() => {
     if (!isOpen || !relationModel || hideControls) return;
-    const delayDebounceFn = setTimeout(async () => {
+
+    let isCancelled = false;
+
+    const fetchOptions = async () => {
       setLoading(true);
       try {
-        const payload = searchTerm ? { domain: [['name', 'ilike', searchTerm]], limit: 7 } : { limit: 7 };
+        const isDefaultSearch = !searchTerm || searchTerm === value;
+        const payload = isDefaultSearch ? { limit: 7 } : { domain: [['name', 'ilike', searchTerm]], limit: 7 };
+        
         const res = await api.post(`/data/${relationModel}/search`, payload);
-        setOptions(Array.isArray(res.data) ? res.data : (res.data?.data || []));
-      } catch (error) { console.error(`❌ Error buscando:`, error); } 
-      finally { setLoading(false); }
-    }, 300);
-    return () => clearTimeout(delayDebounceFn);
-  }, [searchTerm, isOpen, relationModel, hideControls]);
+        
+        if (!isCancelled) {
+          setOptions(Array.isArray(res.data) ? res.data : (res.data?.data || []));
+        }
+      } catch (error) { 
+        console.error(`❌ Error buscando:`, error); 
+      } finally { 
+        if (!isCancelled) setLoading(false); 
+      }
+    };
+
+    if (!searchTerm || searchTerm === value) {
+        fetchOptions();
+        return () => { isCancelled = true; };
+    }
+
+    const delayDebounceFn = setTimeout(fetchOptions, 300);
+    
+    return () => {
+        clearTimeout(delayDebounceFn);
+        isCancelled = true;
+    };
+  }, [searchTerm, isOpen, relationModel, value, hideControls]);
 
   const exactMatch = options.some((opt: any) => (opt.name || '').toLowerCase() === searchTerm.trim().toLowerCase());
   const showCreateOptions = searchTerm.trim().length > 0 && !exactMatch;
@@ -71,7 +94,17 @@ export const AsyncMany2one = ({ value, onChange, placeholder = "Comience a escri
   return (
     <div className="relative w-full" ref={ref}>
       <div className="relative group flex items-center w-full">
-        <input ref={inputRef} type="text" value={searchTerm} onChange={(e) => { setSearchTerm(e.target.value); setIsOpen(true); }} onFocus={() => setIsOpen(!hideControls)} onClick={() => setIsOpen(!hideControls)} placeholder={placeholder} readOnly={hideControls} className={`w-full bg-transparent outline-none transition-colors placeholder:text-[#9a9ca5] ${hideControls ? 'cursor-default pointer-events-none' : 'cursor-text'} text-[#111827] m-0 align-middle ${hideControls ? 'border-none' : 'border-b border-transparent hover:border-[#d8dadd] focus:border-[#017e84]'} ${isTableCell ? 'py-0.5 text-[13px] pr-8' : 'py-1 text-[14px] pr-12'}`} />
+        <input 
+            ref={inputRef} 
+            type="text" 
+            value={searchTerm} 
+            onChange={(e) => { setSearchTerm(e.target.value); setIsOpen(true); }} 
+            onFocus={() => setIsOpen(!hideControls)} 
+            onClick={() => setIsOpen(!hideControls)} 
+            placeholder={placeholder} 
+            readOnly={hideControls} 
+            className={`w-full bg-transparent outline-none transition-colors placeholder:text-[#9a9ca5] ${hideControls ? 'cursor-default pointer-events-none' : 'cursor-text'} text-[#111827] m-0 align-middle ${hideControls ? 'border-none' : 'border-b border-transparent hover:border-[#d8dadd] focus:border-[#017e84]'} ${isTableCell ? 'py-0.5 text-[13px] pr-8' : 'py-1 text-[14px] pr-12'}`} 
+        />
         {!hideControls && (
           <div className={`absolute right-0 flex items-center opacity-0 group-hover:opacity-100 transition-opacity bg-transparent ${isTableCell ? 'gap-0.5' : 'gap-1.5'}`}>
             {searchTerm && <button onClick={(e) => { e.stopPropagation(); handleSelection(null, '', null); setIsOpen(true); }} className="text-[#9a9ca5] hover:text-[#d44c59] outline-none"><Icons.X size={isTableCell ? 13 : 14} strokeWidth={2.5} /></button>}
@@ -81,14 +114,22 @@ export const AsyncMany2one = ({ value, onChange, placeholder = "Comience a escri
       </div>
       {isOpen && !hideControls && (
         <div className="absolute left-0 top-full w-full min-w-[280px] bg-white border border-[#d8dadd] shadow-xl py-1.5 z-[100] text-[14px] max-h-72 overflow-y-auto rounded-b-[3px]">
-          {loading ? <div className="px-3 py-2 text-[#9a9ca5] italic flex items-center gap-2"><Icons.Loader2 size={14} className="animate-spin"/> Buscando...</div> : (
+          {loading ? (
+             <div className="px-3 py-2 text-[#9a9ca5] italic flex items-center gap-2">
+                <Icons.Loader2 size={14} className="animate-spin text-[#017e84]" /> Buscando...
+             </div>
+          ) : (
               <>
-                {options.map((opt: any) => <div key={opt.id} onClick={() => handleSelection(opt.id, opt.name || opt.id, opt)} className="px-4 py-1.5 hover:bg-[#F9FAFB] cursor-pointer text-[#111827]">{opt.name || opt.id}</div>)}
+                {options.map((opt: any) => <div key={opt.id} onClick={() => handleSelection(opt.id, opt.name || opt.id, opt)} className="px-4 py-1.5 hover:bg-[#F9FAFB] cursor-pointer text-[#111827] truncate">{opt.name || opt.id}</div>)}
                 {options.length > 0 && showCreateOptions && <div className="border-t border-[#e7e9ed] my-1"></div>}
                 {showCreateOptions && (
-                  <><div onClick={(e) => { e.stopPropagation(); setLoading(true); api.post(`/data/${relationModel}/create`, { name: searchTerm }).then(res => { if(res.data?.data) handleSelection(res.data.data.id, res.data.data.name, res.data.data); setLoading(false); }).catch(()=> {alert("Error"); setLoading(false);}); }} className="px-4 py-1.5 hover:bg-[#F9FAFB] cursor-pointer text-[#017e84]">Crear <strong className="font-semibold text-[#111827]">"{searchTerm}"</strong></div>
+                  <><div onClick={(e) => { e.stopPropagation(); setLoading(true); api.post(`/data/${relationModel}/create`, { name: searchTerm }).then(res => { if(res.data?.data) handleSelection(res.data.data.id, res.data.data.name, res.data.data); setLoading(false); }).catch(()=> {alert("Error"); setLoading(false);}); }} className="px-4 py-1.5 hover:bg-[#F9FAFB] cursor-pointer text-[#017e84] truncate">Crear <strong className="font-semibold text-[#111827]">"{searchTerm}"</strong></div>
                   <div onClick={(e) => {e.stopPropagation(); setIsOpen(false); window.open(`/app/${relationModel}/form`, '_blank');}} className="px-4 py-1.5 hover:bg-[#F9FAFB] cursor-pointer text-[#017e84]">Crear y editar...</div></>
                 )}
+                {options.length > 0 && <div className="border-t border-[#e7e9ed] my-1"></div>}
+                <div onClick={(e) => { e.stopPropagation(); setIsOpen(false); onSearchMore && onSearchMore(searchTerm); }} className="px-4 py-1.5 hover:bg-[#F9FAFB] cursor-pointer text-[#017e84] flex items-center gap-1.5">
+                  Buscar más...
+                </div>
               </>
           )}
         </div>

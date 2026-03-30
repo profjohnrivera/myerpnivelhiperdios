@@ -1,19 +1,34 @@
 // frontend/src/components/TopNavBar.tsx
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import * as Icons from 'lucide-react';
+
+// Hook auxiliar para cerrar al hacer clic fuera
+const useOnClickOutside = (ref: any, handler: any) => {
+    useEffect(() => {
+        const listener = (event: any) => {
+            if (!ref.current || ref.current.contains(event.target)) return;
+            handler(event);
+        };
+        document.addEventListener('mousedown', listener);
+        return () => document.removeEventListener('mousedown', listener);
+    }, [ref, handler]);
+};
 
 export const TopNavBar: React.FC = () => {
     const [menus, setMenus] = useState<any[]>([]);
     const [activeAppId, setActiveAppId] = useState<string | null>(sessionStorage.getItem('active_app_id'));
     const [openDropdown, setOpenDropdown] = useState<string | null>(null);
+    const navRef = useRef(null); // Ref para englobar la navegación y cerrar dropdowns
     
     const location = useLocation();
     const navigate = useNavigate();
     const userName = sessionStorage.getItem('user_name') || 'Admin';
 
-    // 🚀 Lógica para detectar si el usuario volvió al Home o cambió de App
+    // Cierra el dropdown si se hace click fuera
+    useOnClickOutside(navRef, () => setOpenDropdown(null));
+
     useEffect(() => {
         const fetchMenus = () => {
             api.get('/ui/menu')
@@ -26,23 +41,18 @@ export const TopNavBar: React.FC = () => {
         };
 
         fetchMenus();
-        
-        // Escuchamos el evento personalizado del AppSwitcher o cambios en la ruta
         window.addEventListener('app_changed', handleAppChange);
         return () => window.removeEventListener('app_changed', handleAppChange);
     }, []);
 
-    // Si estamos en la raíz (/app) sin nada más, borramos la app activa
     useEffect(() => {
         if (location.pathname === '/app' || location.pathname === '/app/') {
             sessionStorage.removeItem('active_app_id');
             setActiveAppId(null);
         } else if (!activeAppId && menus.length > 0) {
-            // Auto-detectar la app si alguien refresca la página (F5) dentro de un módulo
             const currentAction = location.pathname.split('/')[2];
             const currentMenu = menus.find(m => m.action === currentAction);
             if (currentMenu) {
-                // Rastrear hasta la raíz
                 let parent = currentMenu.parent_id;
                 let rootId = currentMenu.id || currentMenu._id;
                 while (parent) {
@@ -57,8 +67,6 @@ export const TopNavBar: React.FC = () => {
         }
     }, [location.pathname, menus, activeAppId]);
 
-
-    // 🚀 HASH MAP ESPACIAL (Reciclado de tu código anterior)
     const getId = (item: any): string | null => {
         if (!item) return null;
         const rawId = item.id || item._id || (Array.isArray(item) ? item[0] : item);
@@ -92,73 +100,73 @@ export const TopNavBar: React.FC = () => {
         navigate('/login');
     };
 
-    // =========================================================================
-    // 🎨 RENDERIZADOR DE DROPDOWNS (Odoo Style Top Bar)
-    // =========================================================================
     const activeAppMenus = activeAppId ? (menuTree[activeAppId] || []) : [];
     const activeAppDetails = menus.find(m => String(getId(m)) === activeAppId);
 
     return (
         <header className="h-[46px] w-full bg-[#714B67] flex items-center justify-between px-4 shadow-sm z-50 flex-shrink-0">
             
-            {/* ZONA IZQUIERDA: Botón Home y Submenús */}
-            <div className="flex items-center h-full gap-2">
-                
-                {/* Botón Home (App Switcher Trigger) */}
+            <div className="flex items-center h-full gap-2" ref={navRef}>
                 <Link to="/app" className="p-2 mr-2 text-white/90 hover:text-white hover:bg-white/10 rounded-[3px] transition-colors">
-                    <Icons.Grid3X3 size={20} />
+                    {/* SVG Odoo Original */}
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14px" height="14px" viewBox="0 0 14 14">
+                        <g fill="currentColor">
+                            <rect width="3" height="3" x="0" y="0"></rect><rect width="3" height="3" x="5" y="0"></rect><rect width="3" height="3" x="10" y="0"></rect>
+                            <rect width="3" height="3" x="0" y="5"></rect><rect width="3" height="3" x="5" y="5"></rect><rect width="3" height="3" x="10" y="5"></rect>
+                            <rect width="3" height="3" x="0" y="10"></rect><rect width="3" height="3" x="5" y="10"></rect><rect width="3" height="3" x="10" y="10"></rect>
+                        </g>
+                    </svg>
                 </Link>
 
-                {/* Título de la App Activa */}
                 {activeAppDetails && (
-                    <span className="text-white font-medium text-[15px] mr-6 hidden sm:block tracking-wide">
+                    <span className="text-white font-semibold text-[15px] mr-6 hidden sm:block tracking-wide uppercase">
                         {activeAppDetails.name}
                     </span>
                 )}
 
-                {/* Submenús Horizontales (Solo se muestran si hay una App activa) */}
                 {activeAppId && activeAppMenus.map(menu => {
                     const menuId = getId(menu)!;
                     const children = menuTree[menuId] || [];
                     const hasChildren = children.length > 0;
 
-                    // Si NO tiene hijos, es un botón directo en la barra superior
                     if (!hasChildren && menu.action) {
                         return (
                             <Link 
                                 key={menuId}
                                 to={`/app/${menu.action}/list`}
-                                className="h-full px-3 flex items-center text-white/90 text-[13px] hover:bg-white/10 hover:text-white transition-colors"
+                                className="h-full px-3 flex items-center text-white/90 text-[14px] hover:bg-white/10 hover:text-white transition-colors"
                             >
                                 {menu.name}
                             </Link>
                         );
                     }
 
-                    // Si TIENE hijos, es un Dropdown
+                    // 🚀 ODOO 20 DROPDOWN: Se abre por CLICK, fondo blanco cuando está activo
                     return (
-                        <div 
-                            key={menuId} 
-                            className="relative h-full flex items-center"
-                            onMouseEnter={() => setOpenDropdown(menuId)}
-                            onMouseLeave={() => setOpenDropdown(null)}
-                        >
-                            <button className={`h-full px-3 flex items-center text-[13px] transition-colors ${openDropdown === menuId ? 'bg-white/10 text-white' : 'text-white/90 hover:bg-white/10 hover:text-white'}`}>
+                        <div key={menuId} className="relative h-full flex items-center">
+                            <button 
+                                onClick={() => setOpenDropdown(openDropdown === menuId ? null : menuId)}
+                                className={`h-full px-3 flex items-center text-[14px] transition-colors outline-none
+                                    ${openDropdown === menuId 
+                                        ? 'bg-white text-[#111827]' 
+                                        : 'text-white/90 hover:bg-white/10 hover:text-white'
+                                    }`}
+                            >
                                 {menu.name}
                             </button>
 
-                            {/* El Menú Desplegable */}
                             {openDropdown === menuId && (
-                                <div className="absolute top-[46px] left-0 min-w-[200px] bg-white shadow-xl border border-[#e5e7eb] rounded-b-[3px] py-1 flex flex-col">
+                                // 🚀 MENÚ DESPLEGABLE: Fondo blanco, pegado al botón
+                                <div className="absolute top-[46px] left-0 min-w-[200px] bg-white shadow-lg border border-[#d8dadd] border-t-0 rounded-b-[3px] py-1 flex flex-col z-[9999]">
                                     {children.map(child => {
                                         const actionName = child.action || child.model_name;
-                                        if (!actionName || actionName === 'null') return null; // Ignoramos niveles 3 por ahora para mantener Odoo Style simple
+                                        if (!actionName || actionName === 'null') return null; 
                                         
                                         return (
                                             <Link
                                                 key={getId(child)}
                                                 to={`/app/${actionName}/list`}
-                                                className="px-4 py-2 text-[13px] text-[#374151] hover:bg-[#f3f4f6] hover:text-[#017e84] transition-colors"
+                                                className="px-5 py-1.5 text-[14px] text-[#111827] hover:bg-[#F9FAFB] transition-colors whitespace-nowrap"
                                                 onClick={() => setOpenDropdown(null)}
                                             >
                                                 {child.name}
@@ -172,25 +180,23 @@ export const TopNavBar: React.FC = () => {
                 })}
             </div>
 
-            {/* ZONA DERECHA: Perfil */}
+            {/* SECCIÓN DERECHA (Usuario) */}
             <div className="flex items-center h-full">
                 <div className="flex items-center gap-2 px-3 h-full hover:bg-white/10 cursor-pointer transition-colors group relative">
-                    <div className="w-6 h-6 rounded-full bg-white/20 text-white flex items-center justify-center text-[11px] font-bold">
+                    <div className="w-6 h-6 rounded bg-[#e88134] text-white flex items-center justify-center text-[12px] font-bold shadow-sm">
                         {userName.charAt(0).toUpperCase()}
                     </div>
                     <span className="text-white/90 text-[13px] hidden md:block">
                         {userName}
                     </span>
                     
-                    {/* Dropdown del Perfil */}
-                    <div className="absolute top-[46px] right-0 w-[150px] bg-white shadow-xl border border-[#e5e7eb] rounded-b-[3px] py-1 hidden group-hover:flex flex-col">
-                        <button onClick={handleLogout} className="px-4 py-2 text-[13px] text-[#ef4444] text-left hover:bg-[#f3f4f6] transition-colors flex items-center">
+                    <div className="absolute top-[46px] right-0 w-[150px] bg-white shadow-lg border border-[#d8dadd] border-t-0 rounded-b-[3px] py-1 hidden group-hover:flex flex-col z-[9999]">
+                        <button onClick={handleLogout} className="px-4 py-2 text-[14px] text-[#d44c59] text-left hover:bg-[#F9FAFB] transition-colors flex items-center">
                             <Icons.LogOut size={14} className="mr-2" /> Cerrar Sesión
                         </button>
                     </div>
                 </div>
             </div>
-
         </header>
     );
 };

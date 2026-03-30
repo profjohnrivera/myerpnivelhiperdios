@@ -21,6 +21,7 @@ pwd_context = CryptContext(
 def is_password_hash(value: Optional[str]) -> bool:
     """
     Detecta si el valor ya parece un hash soportado por passlib.
+    Evita re-hashear un hash ya existente.
     """
     if not value or not isinstance(value, str):
         return False
@@ -33,6 +34,8 @@ def is_password_hash(value: Optional[str]) -> bool:
 async def hash_password(password: str) -> str:
     """
     Convierte una contraseña plana en un hash irreversible.
+    Usa asyncio.to_thread para no bloquear el event loop
+    (pbkdf2_sha512 con 300k rounds es CPU-intensivo).
     """
     if password is None:
         raise ValueError("No se puede hashear una contraseña vacía.")
@@ -63,7 +66,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     """
-    Empaqueta el ID del usuario en un token firmado.
+    Empaqueta el ID del usuario en un token JWT firmado.
     """
     to_encode = data.copy()
 
@@ -81,7 +84,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> Union[int, str]:
     """
     MIDDLEWARE DE SEGURIDAD:
-    Decodifica el token y devuelve el ID real del usuario.
+    Decodifica el token JWT y devuelve el ID real del usuario.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

@@ -2,43 +2,48 @@
 
 @theme {
   /* =========================================
-     🎨 1. PALETA DE COLORES ODOO 19 ENTERPRISE
+     🖋️ 1. TIPOGRAFÍA (SEGÚN ODOO :ROOT)
      ========================================= */
-     
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Ubuntu, "Noto Sans", Arial, "Odoo Unicode Support Noto", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+
+  /* =========================================
+     🎨 2. PALETA DE COLORES ODOO 20 NATIVA
+     (Extraída de variables --os-gray y --o-color)
+     ========================================= */
+  --color-odoo-gray-100: #F9FAFB;     /* Fondo de la aplicación y cabeceras */
+  --color-odoo-gray-200: #e7e9ed;     /* Fondo secundario / Inputs */
+  --color-odoo-gray-300: #d8dadd;     /* Bordes principales */
+  --color-odoo-gray-400: #9a9ca5;     /* Texto silenciado / Iconos */
+  --color-odoo-gray-600: #5f636f;     /* Texto secundario */
+  --color-odoo-gray-700: #374151;     /* COLOR DE CUERPO NATIVO */
+  --color-odoo-gray-900: #111827;     /* Texto de encabezados / Énfasis */
+
   /* Colores de Marca y Acción */
   --color-odoo-primary: #714B67;
-  --color-odoo-primary-hover: #624159; /* Extraído de --os-primary-button-hover-bg */
+  --color-odoo-primary-hover: #624159;
   --color-odoo-link: #017e84;
   --color-odoo-link-hover: #01585c;
-  
-  /* Colores de Estado (Feedback) */
+
+  /* Colores de Estado */
   --color-odoo-success: #28a745;
   --color-odoo-info: #17a2b8;
   --color-odoo-warning: #e99d00;
   --color-odoo-danger: #d44c59;
   
-  /* Escala de Grises Estructural */
-  --color-odoo-bg: #F9FAFB;         /* --body-bg */
-  --color-odoo-hover: #e7e9ed;      /* --secondary-bg */
-  --color-odoo-border: #d8dadd;     /* --border-color */
-  --color-odoo-text-muted: #5f636f; /* --gray-600 */
-  --color-odoo-text-dark: #111827;  /* --body-color */
+  /* 🔴 EL SELLO ODOO 20: Hover transparente y Fondo de Fila */
+  --color-odoo-table-hover: rgba(0, 0, 0, 0.055); 
+  --color-odoo-row-bg: #FFFFFF;
 
   /* =========================================
-     ☁️ 2. SOMBRAS EXACTAS DE ODOO
+     ☁️ 3. SOMBRAS Y BORDES
      ========================================= */
   --shadow-odoo-sm: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
   --shadow-odoo-base: 0 0.5rem 1rem rgba(0, 0, 0, 0.15);
-  --shadow-odoo-lg: 0 1rem 3rem rgba(0, 0, 0, 0.175);
-
-  /* =========================================
-     🖋️ 3. TIPOGRAFÍA ODOO
-     ========================================= */
-  --font-odoo-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Ubuntu, "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --shadow-odoo-inset: inset 0 1px 2px rgba(0, 0, 0, 0.075);
 }
 
 /* =========================================
-   🏗️ RESET Y ESTRUCTURA BASE
+   🏗️ RESET Y ESTRUCTURA BASE (VIGENCIA 100 AÑOS)
    ========================================= */
 @layer base {
   html, body {
@@ -48,17 +53,16 @@
     margin: 0;
     padding: 0;
     
-    /* Inyección del ADN Tipográfico */
-    font-family: var(--font-odoo-sans);
-    font-size: 0.875rem; /* 14px exactos */
+    /* Configuración Maestra por Herencia */
+    font-family: var(--font-sans);
+    font-size: 14px; /* 0.875rem oficial */
     font-weight: 400;
     line-height: 1.5;
     
-    /* Inyección de Colores Base */
-    color: var(--color-odoo-text-dark);
-    background-color: var(--color-odoo-bg);
+    /* Fondo "Integrated" de Odoo 20 */
+    color: var(--color-odoo-gray-700);
+    background-color: var(--color-odoo-gray-100);
     
-    /* Mejoras de Renderizado */
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     -webkit-text-size-adjust: 100%;
@@ -69,11 +73,18 @@
     box-sizing: border-box;
   }
 
-  /* Asegura que los inputs y textareas no usen la fuente del navegador */
+  /* Normalización de controles de formulario */
   input, textarea, select, button {
     font-family: inherit;
     font-size: inherit;
     line-height: inherit;
+    color: inherit;
+  }
+
+  /* Tablas: Forzar el layout fijo y el colapso de bordes de Odoo */
+  table {
+    table-layout: fixed;
+    border-collapse: collapse;
   }
 }
 
@@ -81,24 +92,18 @@
    🛠️ CLASES DE UTILIDAD ESPECÍFICAS
    ========================================= */
 @layer utilities {
-  
-  /* Sombra para el "Card" (Hoja del Formulario) y Botones */
+  /* Sombra suave para las tarjetas y tablas blancas */
   .odoo-shadow {
     box-shadow: var(--shadow-odoo-sm);
   }
   
-  /* Sombra para Menús Desplegables y Modales */
-  .odoo-dropdown-shadow {
-    box-shadow: var(--shadow-odoo-base);
-  }
-  
-  /* Anillo de Foco Turquesa (Inputs y Checkboxes) */
+  /* El anillo de enfoque turquesa oficial */
   .odoo-focus-ring {
-    box-shadow: 0 0 0 0.25rem rgba(1, 126, 132, 0.5); /* 0.5 de opacidad oficial */
+    box-shadow: 0 0 0 0.25rem rgba(1, 126, 132, 0.25);
     outline: none;
   }
   
-  /* Scrollbar Fino (Replicando el o-scrollbar-thin de Odoo) */
+  /* Scrollbar exacto de Odoo Enterprise */
   .odoo-scrollbar::-webkit-scrollbar {
     width: 8px;
     height: 8px;
@@ -107,12 +112,17 @@
     background: transparent;
   }
   .odoo-scrollbar::-webkit-scrollbar-thumb {
-    background-color: #d8dadd; /* --gray-300 */
+    background-color: var(--color-odoo-gray-300);
     border-radius: 4px;
     border: 2px solid transparent;
     background-clip: padding-box;
   }
   .odoo-scrollbar::-webkit-scrollbar-thumb:hover {
-    background-color: #9a9ca5; /* --gray-400 */
+    background-color: var(--color-odoo-gray-400); 
+  }
+
+  /* Utilidad para el hover transparente exacto */
+  .odoo-table-row-hover:hover {
+    background-color: var(--color-odoo-table-hover);
   }
 }

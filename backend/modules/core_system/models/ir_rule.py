@@ -149,6 +149,16 @@ class IrRule(Model):
             ("active", "=", True),
         ])
 
+        # FIX DEFINITIVO: cargar los datos de las reglas desde BD.
+        # ORM.search() solo retorna IDs en el Graph, sin valores de campos.
+        # rule.domain_force sin load_data() → lee Field.default="[]" (vacío)
+        # → json.loads("[]") = [] → dominio vacío → sin filtro → todos ven todo.
+        if rules and hasattr(rules, "load_data"):
+            try:
+                await rules.load_data()
+            except Exception:
+                pass
+
         user_group_ids = await cls._user_group_ids(user_id)
         combined_domain = []
 
@@ -189,8 +199,20 @@ class IrRule(Model):
 
             try:
                 parsed_domain = json.loads(raw_domain)
+
+                # FIX 1: saltar reglas con dominio vacío.
+                # Una regla '[]' no restringe nada pero sí corrompe el
+                # combined_domain al generar ["&", [...]] malformado → sin filtro.
+                if not parsed_domain:
+                    continue
+
+                # FIX 2: usar OR (|) entre reglas del mismo modelo, como Odoo.
+                # AND (&) significaría "registros que cumplen TODAS las reglas"
+                # → resultado vacío si hay dos reglas restrictivas distintas.
+                # OR (|) significa "registros que cumplen AL MENOS UNA regla"
+                # → correcto para "ves los tuyos O los de tu equipo".
                 if combined_domain:
-                    combined_domain = ["&"] + combined_domain + parsed_domain
+                    combined_domain = ["|"] + combined_domain + parsed_domain
                 else:
                     combined_domain = parsed_domain
             except Exception as e:

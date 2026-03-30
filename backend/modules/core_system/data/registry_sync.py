@@ -1,12 +1,24 @@
 # backend/modules/core_system/data/registry_sync.py
+
 from app.core.registry import Registry
 
 
 async def sync_models_and_fields(env):
     """
-    🧠 SINCRONIZADOR DEL KERNEL (RAM -> DB)
-    Estricto estándar Odoo 20: 2 Fases seguras (Modelos -> Guardado -> Campos)
+    🧠 SINCRONIZADOR CONSTITUCIONAL DEL REGISTRY
+    ---------------------------------------------------------
+    Vuelca la arquitectura viva del Registry hacia:
+      - ir.model
+      - ir.model.fields
+
+    Diseño definitivo:
+    - Idempotente
+    - No depende de reconsultar ir.model después de crear modelos
+    - Usa el grafo vivo actual
+    - Persiste al final en un solo save
+    - Compatible con IDs temporales del Graph y su remapeo final
     """
+
     print("   🧠 [SYNC] Volcando Arquitectura del Registry a la Base de Datos...")
 
     IrModel = env["ir.model"]
@@ -16,87 +28,106 @@ async def sync_models_and_fields(env):
     storage = PostgresGraphStorage()
 
     models_dict = Registry.get_all_models()
+
     modelos_creados = 0
+    modelos_actualizados = 0
     campos_creados = 0
+    campos_actualizados = 0
 
-    # -----------------------------------------------------------------
-    # FASE 1: Registro de Modelos
-    # -----------------------------------------------------------------
+    # Mapa en memoria: modelo técnico -> record de ir.model
+    model_records = {}
+
+    # =========================================================
+    # FASE 1: SINCRONIZAR MODELOS
+    # =========================================================
     for tech_name, model_class in models_dict.items():
-        if getattr(model_class, "_abstract", False):
-            continue
+        human_name = (
+            getattr(model_class, "_description", None)
+            or getattr(model_class, "__name__", None)
+            or tech_name
+        )
 
-        if hasattr(model_class, "_description") and model_class._description:
-            human_name = model_class._description
+        owner_module = None
+        try:
+            owner_module = Registry.get_model_owner(tech_name)
+        except Exception:
+            owner_module = None
+
+        values = {
+            "name": str(human_name)[:255],
+            "model": tech_name,
+            "state": "base",
+            "module": owner_module,
+            "transient": bool(getattr(model_class, "_transient", False)),
+            "abstract": bool(getattr(model_class, "_abstract", False)),
+            "active": True,
+        }
+
+        existing = await IrModel.search([("model", "=", tech_name)], limit=1)
+
+        if existing:
+            rec = existing[0]
+            await rec.write(values)
+            modelos_actualizados += 1
         else:
-            human_name = model_class.__name__
-
-        existing_model = await IrModel.search([("model", "=", tech_name)])
-
-        if not existing_model:
-            await IrModel.create({
-                "name": human_name[:50],
-                "model": tech_name,
-                "state": "base",
-            })
+            rec = await IrModel.create(values)
             modelos_creados += 1
-        else:
-            # ✅ FIX CRÍTICO:
-            # write() en tu ORM es método de instancia, no de clase.
-            await existing_model[0].write({
-                "name": human_name[:50]
-            })
 
-    # -----------------------------------------------------------------
-    # MATERIALIZAR A DISCO ANTES DE CAMPOS
-    # -----------------------------------------------------------------
-    await storage.save(env.graph)
+        model_records[tech_name] = rec
 
-    # -----------------------------------------------------------------
-    # FASE 2: Registro de Campos
-    # -----------------------------------------------------------------
+    # =========================================================
+    # FASE 2: SINCRONIZAR CAMPOS
+    # =========================================================
     for tech_name, model_class in models_dict.items():
-        if getattr(model_class, "_abstract", False):
+        model_rec = model_records.get(tech_name)
+        if not model_rec:
+            print(f"   ⚠️ [SYNC] No se pudo resolver record técnico para: {tech_name}")
             continue
 
-        existing_model = await IrModel.search([("model", "=", tech_name)])
-        if not existing_model:
-            continue
+        model_id = model_rec.id
+        fields_meta = Registry.get_fields_for_model(tech_name) or {}
 
-        model_id = existing_model[0].id
-        fields_meta = Registry.get_fields_for_model(tech_name)
+        for field_name, meta in fields_meta.items():
+            label = meta.get("label") or meta.get("string") or field_name
+            ttype = meta.get("type") or meta.get("ttype") or "string"
+            relation = meta.get("relation") or meta.get("target") or ""
 
-        for f_name, f_meta in fields_meta.items():
-            if f_name.startswith("__"):
-                continue
+            values = {
+                "name": field_name,
+                "field_description": str(label)[:255],
+                "model": tech_name,
+                "model_id": model_id,
+                "ttype": ttype,
+                "relation": relation,
+                "required": bool(meta.get("required", False)),
+                "readonly": bool(meta.get("readonly", False)),
+                "index": bool(meta.get("index", False)),
+                "store": bool(meta.get("store", True)),
+                "translate": bool(meta.get("translate", False)),
+                "active": True,
+            }
 
             existing_field = await IrModelFields.search([
-                ("name", "=", f_name),
-                ("model_id", "=", model_id),
-            ])
+                ("model", "=", tech_name),
+                ("name", "=", field_name),
+            ], limit=1)
 
-            if not existing_field:
-                await IrModelFields.create({
-                    "name": f_name,
-                    "field_description": f_meta.get("label", f_name)[:50],
-                    "model_id": model_id,
-                    "ttype": f_meta.get("type", "string"),
-                    "state": "base",
-                    "relation": f_meta.get("target") or f_meta.get("relation"),
-                    "required": bool(f_meta.get("required", False)),
-                    "readonly": bool(f_meta.get("readonly", False)),
-                    "index": bool(f_meta.get("index", False)),
-                })
-                campos_creados += 1
+            if existing_field:
+                await existing_field[0].write(values)
+                campos_actualizados += 1
             else:
-                # También actualizamos metadatos por si el campo cambió
-                await existing_field[0].write({
-                    "field_description": f_meta.get("label", f_name)[:50],
-                    "ttype": f_meta.get("type", "string"),
-                    "relation": f_meta.get("target") or f_meta.get("relation"),
-                    "required": bool(f_meta.get("required", False)),
-                    "readonly": bool(f_meta.get("readonly", False)),
-                    "index": bool(f_meta.get("index", False)),
-                })
+                await IrModelFields.create(values)
+                campos_creados += 1
 
-    print(f"      ✅ Sincronización completa: {modelos_creados} Modelos y {campos_creados} Campos estandarizados en BD.")
+    # =========================================================
+    # FASE 3: PERSISTENCIA FINAL ÚNICA
+    # =========================================================
+    await storage.save(env.graph)
+
+    print(
+        "      ✅ Sincronización completa: "
+        f"{modelos_creados} modelos creados, "
+        f"{modelos_actualizados} modelos actualizados, "
+        f"{campos_creados} campos creados, "
+        f"{campos_actualizados} campos actualizados."
+    )

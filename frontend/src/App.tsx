@@ -2,35 +2,37 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 
-// 🛡️ IMPORTACIÓN CRÍTICA ACTUALIZADA: Ahora apunta a la capa de red
+// 🛡️ CAPA DE RED
 import './api/interceptor';
 
 // 🧱 COMPONENTES
-// (Nota: Si moviste TopNavBar dentro de widgets/, ajusta la ruta a './components/widgets/TopNavBar')
 import { TopNavBar } from './components/TopNavBar'; 
 
-// 📍 PÁGINAS (Vistas orquestadoras aisladas)
+// 📍 PÁGINAS (Vistas orquestadoras)
 import { AppSwitcher } from './pages/AppSwitcher';
 import { ModelPlayer } from './pages/ModelPlayer';
 import { Login } from './pages/Login';
 
-// ============================================================================
-// 🛑 GUARDIÁN DE RUTAS (El cadenero del club)
-// 🛡️ FASE 4: Cambiado a memoria de sesión para blindaje XSS.
-// ============================================================================
+/**
+ * 🛑 GUARDIÁN DE RUTAS
+ * Seguridad basada en memoria de sesión (sessionStorage).
+ */
 const ProtectedRoute = ({ children }: { children: JSX.Element }) => {
     const token = sessionStorage.getItem('token');
-    
-    // Si no hay llave en la memoria RAM volátil, patada directa al login
     if (!token) {
         return <Navigate to="/login" replace />;
     }
     return children;
 };
 
-// ============================================================================
-// 🚀 APLICACIÓN PRINCIPAL (Arquitectura HiperDios - Odoo 20 Style)
-// ============================================================================
+/**
+ * 🚀 APLICACIÓN PRINCIPAL (Nivel HiperDios - Réplica Odoo 20)
+ * * Cambios realizados para la perfección visual:
+ * 1. bg-odoo-gray-100: Fondo oficial #F9FAFB (Gris nube).
+ * 2. text-odoo-gray-700: Color de texto body oficial #374151.
+ * 3. text-[14px]: Tamaño base que heredarán todos los formularios y tablas.
+ * 4. Antialiased: Suavizado de fuente para máxima legibilidad.
+ */
 export const App: React.FC = () => {
     return (
         <BrowserRouter>
@@ -43,19 +45,19 @@ export const App: React.FC = () => {
                     path="/app/*" 
                     element={
                         <ProtectedRoute>
-                            {/* 💎 LAYOUT CORPORATIVO: Columna vertical (100vw x 100vh) */}
-                            <div className="flex flex-col h-screen w-screen bg-[#F9FAFB] overflow-hidden font-sans text-[#111827]">
+                            {/* 💎 LAYOUT CORPORATIVO: Inyección de herencia global */}
+                            <div className="flex flex-col h-screen w-screen bg-transparent overflow-hidden font-sans text-[14px] text-odoo-gray-700 antialiased">
                                 
-                                {/* 1. LA BARRA SUPERIOR (Fija) */}
+                                {/* 1. NAVEGACIÓN SUPERIOR (Fija) */}
                                 <TopNavBar />
                                 
-                                {/* 2. EL LIENZO PRINCIPAL (Desplazable) */}
-                                <main className="flex-1 flex flex-col overflow-hidden bg-[#F9FAFB] relative">
+                                {/* 2. EL LIENZO PRINCIPAL (Gris Nube) */}
+                                <main className="flex-1 flex flex-col overflow-hidden bg-odoo-gray-100 relative">
                                     <Routes>
-                                        {/* Motor principal que lee las vistas */}
+                                        {/* Motor principal de lectura de modelos y vistas */}
                                         <Route path=":modelName/:viewType/:id?" element={<ModelPlayer />} />
                                         
-                                        {/* 🚀 HOME: El Selector de Aplicaciones (App Switcher) */}
+                                        {/* Home / Selector de Apps */}
                                         <Route path="" element={<AppSwitcher />} />
                                     </Routes>
                                 </main>

@@ -1,40 +1,90 @@
-// frontend/src/components/AppSwitcher.tsx
+// frontend/src/pages/AppSwitcher.tsx
+// ============================================================
+// FIX 1: Doble "VENTAS" — El AppSwitcher solo muestra menús
+//   raíz (is_category=True). La deduplicación real ocurre en
+//   el backend (endpoints.py). Aquí filtramos correctamente.
+//
+// FIX 2: Páginas en blanco al clicar Contactos/Productos —
+//   Cuando un menú raíz NO tiene action directa (es una
+//   categoría que agrupa sub-menús), el AppSwitcher buscaba
+//   una acción y al no encontrarla navegaba a /app/dashboard
+//   → pantalla blanca.
+//   SOLUCIÓN: Navegar al primer hijo que SÍ tenga action.
+// ============================================================
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import api from '../api/client';
 import * as Icons from 'lucide-react';
 
 export const AppSwitcher: React.FC = () => {
-    const [apps, setApps] = useState<any[]>([]);
+    const [allMenus, setAllMenus] = useState<any[]>([]);
     const navigate = useNavigate();
 
     useEffect(() => {
         api.get('/ui/menu')
-            .then(res => {
-                const menus = res.data || [];
-                const rootApps = menus.filter((m: any) => 
-                    m.is_category === true || m.is_category === 'True' || !m.parent_id
-                );
-                rootApps.sort((a: any, b: any) => (a.sequence || 100) - (b.sequence || 100));
-                setApps(rootApps);
-            })
-            .catch(err => console.error("Error cargando aplicaciones:", err));
+            .then(res => setAllMenus(res.data || []))
+            .catch(err => console.error("Error cargando menús:", err));
     }, []);
 
+    // Solo mostramos menús raíz (categorías de nivel 0)
+    const rootApps = allMenus
+        .filter((m: any) => m.is_category === true || m.is_category === 'True' || !m.parent_id)
+        .sort((a: any, b: any) => (a.sequence || 100) - (b.sequence || 100));
+
+    // Construir mapa de hijos por parent_id para navegación
+    const getId = (m: any): string | null => {
+        const rawId = m.id || m._id;
+        return rawId != null ? String(rawId) : null;
+    };
+
+    const childrenOf = (parentId: string): any[] => {
+        return allMenus.filter((m: any) => {
+            const pid = m.parent_id;
+            if (!pid) return false;
+            const resolvedPid = Array.isArray(pid) ? String(pid[0]) : String(pid);
+            return resolvedPid === parentId;
+        }).sort((a: any, b: any) => (a.sequence || 100) - (b.sequence || 100));
+    };
+
+    // Encuentra el primer action navegable en el árbol de un nodo
+    const findFirstAction = (menuId: string): string | null => {
+        const children = childrenOf(menuId);
+        for (const child of children) {
+            const action = child.action;
+            if (action && action !== 'null' && action !== 'undefined') {
+                return action;
+            }
+            // Buscar recursivamente en nietos
+            const childId = getId(child);
+            if (childId) {
+                const deeper = findFirstAction(childId);
+                if (deeper) return deeper;
+            }
+        }
+        return null;
+    };
+
     const handleAppClick = (app: any) => {
-        const appId = app.id || app._id || (Array.isArray(app) ? app[0] : app);
-        sessionStorage.setItem('active_app_id', String(appId));
-        
-        // ⚡ SDUI PURO: Cero recursividad adivinadora. El backend debe proveer el punto de entrada.
-        // Si no hay acción directa, abrimos el menú lateral por defecto y cargamos un dashboard vacío.
-        const targetAction = app.action && app.action !== 'null' && app.action !== 'undefined' ? app.action : null;
+        const appId = getId(app);
+        if (!appId) return;
+
+        sessionStorage.setItem('active_app_id', appId);
+        window.dispatchEvent(new Event('app_changed'));
+
+        // FIX 2: Si el menú raíz tiene acción directa, úsala.
+        // Si no (es una categoría que agrupa sub-menús), busca el primer hijo con acción.
+        const directAction = app.action && app.action !== 'null' && app.action !== 'undefined'
+            ? app.action
+            : null;
+
+        const targetAction = directAction || findFirstAction(appId);
 
         if (targetAction) {
             navigate(`/app/${targetAction}/list`);
         } else {
-            // El backend no proveyó acción, dejamos que el layout pinte el menú lateral
-            window.dispatchEvent(new Event('app_changed')); 
-            navigate(`/app/dashboard`); // Ruta fallback genérica
+            // Último recurso: mostrar el AppSwitcher interno (no dashboard vacío)
+            // Solo navega al home del módulo — el TopNavBar mostrará sus sub-menús
+            navigate('/app');
         }
     };
 
@@ -49,7 +99,7 @@ export const AppSwitcher: React.FC = () => {
 
             <div className="max-w-5xl mx-auto w-full px-8 pb-12">
                 <div className="grid grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-6">
-                    {apps.map(app => {
+                    {rootApps.map(app => {
                         const IconComponent = (Icons as any)[app.icon] || Icons.Box;
                         return (
                             <button
@@ -60,7 +110,7 @@ export const AppSwitcher: React.FC = () => {
                                 <div className="w-[84px] h-[84px] rounded-2xl bg-white shadow-sm border border-[#e5e7eb] flex items-center justify-center mb-3 group-hover:shadow-sm group-hover:border-[#017e84] group-hover:-translate-y-1 transition-all duration-100">
                                     <IconComponent size={36} className="text-[#4b5563] group-hover:text-[#017e84] transition-colors" strokeWidth={1.5} />
                                 </div>
-                                <span className="text-[13px] font-medium text-[#374151] group-hover:text-[#111827]">
+                                <span className="text-[13px] font-medium text-[#374151] group-hover:text-[#111827] text-center">
                                     {app.name}
                                 </span>
                             </button>

@@ -1,6 +1,25 @@
 # backend/app/core/models/ir_audit_log.py
+# ============================================================
+# FIX P4-A: datetime.utcnow() reemplazado por datetime.now(UTC).
+#
+# PROBLEMA: datetime.datetime.utcnow() está deprecado desde
+#   Python 3.12 y emite DeprecationWarning en cada log de
+#   auditoría. En Python 3.14 será error.
+#
+# SOLUCIÓN: datetime.now(timezone.utc) que devuelve un objeto
+#   timezone-aware. Para Postgres TIMESTAMP (sin zona), usamos
+#   .replace(tzinfo=None) para mantener el formato naive que
+#   el driver asyncpg espera en columnas TIMESTAMP.
+#   Si en el futuro migras a TIMESTAMPTZ, quita el replace().
+# ============================================================
 import datetime
 from app.core.orm import Model, Field
+
+
+# Helper centralizado para timestamps consistentes en todo el sistema.
+# Naive UTC datetime compatible con columnas Postgres TIMESTAMP.
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
 
 class IrAuditLog(Model):
@@ -24,7 +43,8 @@ class IrAuditLog(Model):
 
     changes = Field(type_="jsonb")
     message = Field(type_="text")
-    timestamp = Field(type_="datetime", default=datetime.datetime.utcnow)
+    # FIX P4-A: usar _utcnow como callable en lugar de utcnow
+    timestamp = Field(type_="datetime", default=_utcnow)
 
     @classmethod
     async def create_from_queue(
@@ -51,5 +71,6 @@ class IrAuditLog(Model):
             "action": action,
             "changes": changes or None,
             "message": message,
-            "timestamp": datetime.datetime.utcnow().isoformat(),
+            # FIX P4-A: _utcnow() en lugar de utcnow()
+            "timestamp": _utcnow().isoformat(),
         })
