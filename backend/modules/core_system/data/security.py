@@ -9,78 +9,50 @@
 #   como criterio final de seguridad
 # ============================================================
 
-
-async def _exec(storage, query, *args):
-    pool_or_conn = await storage.get_connection()
-    if hasattr(pool_or_conn, "acquire"):
-        async with pool_or_conn.acquire() as conn:
-            return await conn.execute(query, *args)
-    return await pool_or_conn.execute(query, *args)
+from app.core.clock import utc_now_naive
 
 
-async def _fetch(storage, query, *args):
-    pool_or_conn = await storage.get_connection()
-    if hasattr(pool_or_conn, "acquire"):
-        async with pool_or_conn.acquire() as conn:
-            return await conn.fetch(query, *args)
-    return await pool_or_conn.fetch(query, *args)
+async def _exec(conn, query, *args):
+    return await conn.execute(query, *args)
 
 
-async def _fetchrow(storage, query, *args):
-    pool_or_conn = await storage.get_connection()
-    if hasattr(pool_or_conn, "acquire"):
-        async with pool_or_conn.acquire() as conn:
-            return await conn.fetchrow(query, *args)
-    return await pool_or_conn.fetchrow(query, *args)
+async def _fetch(conn, query, *args):
+    return await conn.fetch(query, *args)
 
 
-async def _fetchval(storage, query, *args):
-    pool_or_conn = await storage.get_connection()
-    if hasattr(pool_or_conn, "acquire"):
-        async with pool_or_conn.acquire() as conn:
-            return await conn.fetchval(query, *args)
-    return await pool_or_conn.fetchval(query, *args)
+async def _fetchrow(conn, query, *args):
+    return await conn.fetchrow(query, *args)
 
 
-async def _ensure_admin_group(storage, now):
-    """
-    Garantiza que exista un único grupo admin técnico y que quede
-    normalizado con is_system_admin = TRUE.
+async def _fetchval(conn, query, *args):
+    return await conn.fetchval(query, *args)
 
-    Estrategia:
-    1. Buscar por flag técnico
-    2. Fallback de migración por nombre
-    3. Crear si no existe
-    4. Reparar siempre el flag a TRUE
-    """
+
+async def _ensure_admin_group(conn, now):
     admin_group_id = None
 
-    # 1) Buscar por criterio correcto
     try:
         admin_group_id = await _fetchval(
-            storage,
+            conn,
             'SELECT id FROM "res_groups" WHERE is_system_admin = TRUE ORDER BY id LIMIT 1',
         )
     except Exception:
-        # Columna faltante en una BD desfasada
         admin_group_id = None
 
-    # 2) Fallback de migración por nombre visible
     if not admin_group_id:
         try:
             admin_group_id = await _fetchval(
-                storage,
+                conn,
                 'SELECT id FROM "res_groups" WHERE name = $1 ORDER BY id LIMIT 1',
                 "Administración / Ajustes",
             )
         except Exception:
             admin_group_id = None
 
-    # 3) Crear si no existe
     if not admin_group_id:
         try:
             admin_group_id = await _fetchval(
-                storage,
+                conn,
                 """
                 INSERT INTO "res_groups"
                     (name, description, is_system_admin, active, write_version, create_date, write_date)
@@ -92,9 +64,8 @@ async def _ensure_admin_group(storage, now):
                 now,
             )
         except Exception:
-            # Compatibilidad defensiva si la columna aún no existe
             admin_group_id = await _fetchval(
-                storage,
+                conn,
                 """
                 INSERT INTO "res_groups"
                     (name, description, active, write_version, create_date, write_date)
@@ -107,10 +78,9 @@ async def _ensure_admin_group(storage, now):
             )
         print("   ✨ [SEGURIDAD] Grupo Administrador creado.")
 
-    # 4) Reparación convergente: si existe, lo normalizamos
     try:
         await _exec(
-            storage,
+            conn,
             """
             UPDATE "res_groups"
             SET is_system_admin = TRUE
@@ -119,18 +89,14 @@ async def _ensure_admin_group(storage, now):
             admin_group_id,
         )
     except Exception:
-        # Si la columna aún no existe, no bloqueamos el boot
         pass
 
     return admin_group_id
 
 
-async def _ensure_base_user_group(storage, now):
-    """
-    Garantiza que exista el grupo base de usuarios autenticados.
-    """
+async def _ensure_base_user_group(conn, now):
     sales_group_id = await _fetchval(
-        storage,
+        conn,
         'SELECT id FROM "res_groups" WHERE name = $1 ORDER BY id LIMIT 1',
         "Ventas / Usuario",
     )
@@ -138,7 +104,7 @@ async def _ensure_base_user_group(storage, now):
     if not sales_group_id:
         try:
             sales_group_id = await _fetchval(
-                storage,
+                conn,
                 """
                 INSERT INTO "res_groups"
                     (name, description, is_system_admin, active, write_version, create_date, write_date)
@@ -151,7 +117,7 @@ async def _ensure_base_user_group(storage, now):
             )
         except Exception:
             sales_group_id = await _fetchval(
-                storage,
+                conn,
                 """
                 INSERT INTO "res_groups"
                     (name, description, active, write_version, create_date, write_date)
@@ -164,10 +130,9 @@ async def _ensure_base_user_group(storage, now):
             )
         print("   ✨ [SEGURIDAD] Grupo Ventas / Usuario creado.")
 
-    # Convergencia: este grupo nunca debe ser admin
     try:
         await _exec(
-            storage,
+            conn,
             """
             UPDATE "res_groups"
             SET is_system_admin = FALSE
@@ -181,10 +146,7 @@ async def _ensure_base_user_group(storage, now):
     return sales_group_id
 
 
-async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
-    """
-    Crea/actualiza ACL públicos y ACL admin para todos los modelos.
-    """
+async def _ensure_public_and_admin_acl(conn, admin_group_id, now):
     technical_models = {
         "ir.rule",
         "ir.model",
@@ -202,7 +164,7 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
         "res.groups",
     }
 
-    all_models = await _fetch(storage, 'SELECT id, model FROM "ir_model"')
+    all_models = await _fetch(conn, 'SELECT id, model FROM "ir_model"')
     acl_public = 0
     acl_admin = 0
 
@@ -219,16 +181,15 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
         perm_create = not is_technical
         perm_unlink = not is_technical
 
-        # ACL pública
         exists_public = await _fetchval(
-            storage,
+            conn,
             'SELECT id FROM "ir_model_access" WHERE model_id = $1 AND group_id IS NULL LIMIT 1',
             model_id,
         )
 
         if not exists_public:
             await _exec(
-                storage,
+                conn,
                 """
                 INSERT INTO "ir_model_access"
                     (name, model_id, group_id, perm_read, perm_write, perm_create, perm_unlink,
@@ -246,7 +207,7 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
             acl_public += 1
         else:
             await _exec(
-                storage,
+                conn,
                 """
                 UPDATE "ir_model_access"
                 SET perm_read = $1,
@@ -264,9 +225,8 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
                 model_id,
             )
 
-        # ACL admin
         exists_admin = await _fetchval(
-            storage,
+            conn,
             'SELECT id FROM "ir_model_access" WHERE model_id = $1 AND group_id = $2 LIMIT 1',
             model_id,
             admin_group_id,
@@ -274,7 +234,7 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
 
         if not exists_admin:
             await _exec(
-                storage,
+                conn,
                 """
                 INSERT INTO "ir_model_access"
                     (name, model_id, group_id, perm_read, perm_write, perm_create, perm_unlink,
@@ -289,7 +249,7 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
             acl_admin += 1
         else:
             await _exec(
-                storage,
+                conn,
                 """
                 UPDATE "ir_model_access"
                 SET perm_read = TRUE,
@@ -307,12 +267,9 @@ async def _ensure_public_and_admin_acl(storage, admin_group_id, now):
     return acl_public, acl_admin
 
 
-async def _assign_base_group_to_existing_users(storage, sales_group_id):
-    """
-    Todo usuario autenticado debe pertenecer al grupo base.
-    """
+async def _assign_base_group_to_existing_users(conn, sales_group_id):
     all_users = await _fetch(
-        storage,
+        conn,
         'SELECT id FROM "res_users" WHERE active = TRUE',
     )
 
@@ -321,14 +278,14 @@ async def _assign_base_group_to_existing_users(storage, sales_group_id):
     for u in all_users:
         uid = u["id"]
         already = await _fetchval(
-            storage,
+            conn,
             'SELECT 1 FROM "res_users_group_ids_rel" WHERE base_id = $1 AND rel_id = $2',
             uid,
             sales_group_id,
         )
         if not already:
             await _exec(
-                storage,
+                conn,
                 'INSERT INTO "res_users_group_ids_rel" (base_id, rel_id) VALUES ($1, $2)',
                 uid,
                 sales_group_id,
@@ -338,13 +295,9 @@ async def _assign_base_group_to_existing_users(storage, sales_group_id):
     return retroactive
 
 
-async def _reset_sales_rls(storage, now):
-    """
-    Reglas RLS de ventas.
-    El admin ve todo porque bypassa en ir.rule._is_admin_user().
-    """
+async def _reset_sales_rls(conn, now):
     await _exec(
-        storage,
+        conn,
         """
         DELETE FROM "ir_rule"
         WHERE model_name IN ('sale.order', 'sale.order.line')
@@ -352,7 +305,7 @@ async def _reset_sales_rls(storage, now):
     )
 
     await _exec(
-        storage,
+        conn,
         """
         INSERT INTO "ir_rule"
             (name, model_name, domain_force, group_id,
@@ -367,7 +320,7 @@ async def _reset_sales_rls(storage, now):
     )
 
     await _exec(
-        storage,
+        conn,
         """
         INSERT INTO "ir_rule"
             (name, model_name, domain_force, group_id,
@@ -383,41 +336,29 @@ async def _reset_sales_rls(storage, now):
 
 
 async def init_base_security(env):
-    """
-    🛡️ SEGURIDAD ENTERPRISE — SQL DIRECTO
-
-    Principio:
-    - los registros críticos de seguridad se materializan directamente en PostgreSQL
-    - bootstrap idempotente
-    - convergencia automática de datos legacy al criterio técnico correcto
-    """
     print("   🛡️ [SEGURIDAD] Generando Matriz de Accesos Global...")
 
-    import datetime
     from app.core.storage.postgres_storage import PostgresGraphStorage
 
     storage = PostgresGraphStorage()
-    now = datetime.datetime.utcnow()
+    conn = await storage.get_connection()
+    now = utc_now_naive()
 
-    # 1. Grupos base
-    admin_group_id = await _ensure_admin_group(storage, now)
-    sales_group_id = await _ensure_base_user_group(storage, now)
+    admin_group_id = await _ensure_admin_group(conn, now)
+    sales_group_id = await _ensure_base_user_group(conn, now)
 
-    # 2. ACL
     acl_public, acl_admin = await _ensure_public_and_admin_acl(
-        storage=storage,
+        conn=conn,
         admin_group_id=admin_group_id,
         now=now,
     )
 
-    # 3. Grupo base para usuarios existentes
     retroactive = await _assign_base_group_to_existing_users(
-        storage=storage,
+        conn=conn,
         sales_group_id=sales_group_id,
     )
 
-    # 4. RLS de ventas
-    await _reset_sales_rls(storage=storage, now=now)
+    await _reset_sales_rls(conn=conn, now=now)
 
     print(
         f"      ✅ Seguridad en BD: "

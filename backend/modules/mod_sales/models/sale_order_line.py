@@ -1,7 +1,5 @@
 # backend/modules/mod_sales/models/sale_order_line.py
 
-from typing import Dict, Any
-
 from app.core.orm import Field, SelectionField, RelationField, compute, onchange
 from app.core.abstract_models import AbstractDocumentLine
 from app.core.registry import Registry
@@ -13,10 +11,9 @@ class SaleOrderLine(AbstractDocumentLine):
     """
     Línea de pedido de venta.
 
-    P1-A:
-    - la línea mantiene sincronizado el agregado del pedido padre
-      dentro del dominio/graph
-    - ya no dependemos de SQL correctivo en data_write.py
+    Cierre correcto del agregado:
+    - la línea recalcula su subtotal
+    - toda mutación de línea vuelve a recalcular el pedido padre
     """
     _name = "sale.order.line"
     _rec_name = "name"
@@ -87,6 +84,13 @@ class SaleOrderLine(AbstractDocumentLine):
 
         return rs[0] if rs and len(rs) > 0 else None
 
+    @staticmethod
+    def _order_identity(order_value):
+        if not order_value:
+            return None
+        raw = order_value.id if hasattr(order_value, "id") else order_value
+        return int(raw) if str(raw).isdigit() else None
+
     def _recompute_subtotal_now(self):
         if getattr(self, "display_type", None):
             self.price_subtotal = 0.0
@@ -95,6 +99,24 @@ class SaleOrderLine(AbstractDocumentLine):
         qty = float(getattr(self, "product_uom_qty", 0.0) or 0.0)
         price = float(getattr(self, "price_unit", 0.0) or 0.0)
         self.price_subtotal = qty * price
+
+    def _recompute_parent_onchange_now(self):
+        """
+        Solo para feedback inmediato en UI, sin depender de persistencia.
+        """
+        order = getattr(self, "order_id", None)
+        if not order:
+            return
+
+        # solo si realmente tenemos el objeto padre en memoria
+        if hasattr(order, "amount_total"):
+            try:
+                SaleOrderService.recompute_onchange_total(order)
+            except Exception:
+                pass
+
+    async def _recompute_parent_after_mutation(self, order_value):
+        await SaleOrderService.recompute_parent_from_value(order_value, graph=self.graph)
 
     # =========================================================================
     # ONCHANGE
@@ -116,12 +138,14 @@ class SaleOrderLine(AbstractDocumentLine):
             self.name = product_name
             self.price_unit = list_price
             self._recompute_subtotal_now()
+            self._recompute_parent_onchange_now()
         except Exception as e:
             print(f"⚠️ [ONCHANGE ERROR] Fallo al cargar precio del producto: {e}")
 
     @onchange("product_uom_qty", "price_unit", "display_type")
     def _onchange_quantity_or_price(self):
         self._recompute_subtotal_now()
+        self._recompute_parent_onchange_now()
 
     # =========================================================================
     # COMPUTES
@@ -173,79 +197,37 @@ class SaleOrderLine(AbstractDocumentLine):
             self.invoice_status = "no"
 
     # =========================================================================
-    # CRUD SINCRONIZANDO EL PADRE
+    # CRUD HOOKS
     # =========================================================================
 
     @classmethod
-    async def create(cls, vals: Dict[str, Any], context=None):
-        record = await super().create(vals, context=context)
+    async def create(cls, vals, context=None):
+        line = await super().create(vals, context=context)
+        await SaleOrderService.recompute_parent_from_value(getattr(line, "order_id", None), graph=line.graph)
+        return line
 
-        try:
-            await SaleOrderService.sync_order_aggregates_for_line(record, removing=False)
-        except Exception as e:
-            print(f"⚠️ [SALE ORDER LINE] No se pudo sincronizar pedido padre tras create: {e}")
-
-        return record
-
-    async def write(self, vals: Dict[str, Any]) -> bool:
+    async def write(self, vals):
         old_order = getattr(self, "order_id", None)
-        old_order_id = old_order.id if hasattr(old_order, "id") else old_order
+        old_order_id = self._order_identity(old_order)
 
         result = await super().write(vals)
 
-        try:
-            new_order = getattr(self, "order_id", None)
-            new_order_id = new_order.id if hasattr(new_order, "id") else new_order
+        new_order = getattr(self, "order_id", None)
+        new_order_id = self._order_identity(new_order)
 
-            # Mismo pedido -> reemplazar línea viva en el agregado
-            if old_order_id and new_order_id and str(old_order_id) == str(new_order_id):
-                await SaleOrderService.sync_order_aggregates_for_line(
-                    self,
-                    removing=False,
-                    explicit_order=new_order,
-                )
-            else:
-                # Recalcular el pedido anterior si la línea se movió
-                if old_order_id and str(old_order_id).isdigit():
-                    OrderModel = Registry.get_model("sale.order")
-                    if OrderModel:
-                        old_order_rec = OrderModel(_id=int(old_order_id), context=self.graph, env=self._env)
-                        await SaleOrderService.sync_order_aggregates_for_line(
-                            self,
-                            removing=True,
-                            explicit_order=old_order_rec,
-                        )
+        if old_order_id:
+            await self._recompute_parent_after_mutation(old_order)
 
-                # Recalcular el nuevo pedido
-                if new_order_id:
-                    await SaleOrderService.sync_order_aggregates_for_line(
-                        self,
-                        removing=False,
-                        explicit_order=new_order,
-                    )
-
-        except Exception as e:
-            print(f"⚠️ [SALE ORDER LINE] No se pudo sincronizar pedido padre tras write: {e}")
+        if new_order_id and new_order_id != old_order_id:
+            await self._recompute_parent_after_mutation(new_order)
 
         return result
 
-    async def unlink(self) -> bool:
+    async def unlink(self):
         old_order = getattr(self, "order_id", None)
-        old_order_id = old_order.id if hasattr(old_order, "id") else old_order
-
         result = await super().unlink()
 
-        try:
-            if old_order_id and str(old_order_id).isdigit():
-                OrderModel = Registry.get_model("sale.order")
-                if OrderModel:
-                    old_order_rec = OrderModel(_id=int(old_order_id), context=self.graph, env=self._env)
-                    await SaleOrderService.sync_order_aggregates_for_line(
-                        self,
-                        removing=True,
-                        explicit_order=old_order_rec,
-                    )
-        except Exception as e:
-            print(f"⚠️ [SALE ORDER LINE] No se pudo sincronizar pedido padre tras unlink: {e}")
+        if self._order_identity(old_order):
+            await self._recompute_parent_after_mutation(old_order)
 
         return result

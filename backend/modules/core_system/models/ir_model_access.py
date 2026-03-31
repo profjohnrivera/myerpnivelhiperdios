@@ -27,12 +27,8 @@ class IrModelAccess(Model):
     @classmethod
     @ormcache("ir.model.access")
     async def get_permissions(cls, target_model: str, user_id: Union[int, str]) -> Dict[str, bool]:
-        """
-        Calcula la matriz efectiva de permisos para un usuario.
-        """
         env = Context.get_env()
 
-        # system / sudo = acceso total
         if str(user_id) == "system" or (env and getattr(env, "su", False)):
             return {
                 "read": True,
@@ -56,7 +52,7 @@ class IrModelAccess(Model):
         from app.core.storage.postgres_storage import PostgresGraphStorage
 
         storage = PostgresGraphStorage()
-        conn_or_pool = await storage.get_connection()
+        conn = await storage.get_connection()
         safe_uid = int(user_id)
 
         query = """
@@ -84,11 +80,7 @@ class IrModelAccess(Model):
         }
 
         try:
-            if hasattr(conn_or_pool, "acquire"):
-                async with conn_or_pool.acquire() as conn:
-                    rows = await conn.fetch(query, target_model, safe_uid)
-            else:
-                rows = await conn_or_pool.fetch(query, target_model, safe_uid)
+            rows = await conn.fetch(query, target_model, safe_uid)
 
             for row in rows:
                 perms["read"] = perms["read"] or bool(row["perm_read"])

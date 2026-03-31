@@ -9,20 +9,6 @@ from app.core.registry import Registry
 
 
 class ViewScaffolder:
-    """
-    🏗️ GENERADOR DE UI AUTOMÁTICO (Runtime oficial de vistas)
-
-    Decisión arquitectónica definitiva:
-    - El runtime REAL de vistas vive aquí.
-    - ir.ui.view NO es la fuente canónica de ejecución.
-    - ir.ui.view puede usarse como catálogo persistente / snapshot técnico,
-      pero NO como override runtime automático.
-
-    CIERRE SDUI ↔ MODELO:
-    - Toda vista explícita o implícita se valida contra el metamodelo.
-    - La validación usa runtime_fields del Registry.
-    """
-
     TYPE_MAPPING = {
         "string": "TextInput",
         "text": "TextArea",
@@ -301,8 +287,6 @@ class ViewScaffolder:
                 )
 
         elif node_type in cls.CONTAINER_TYPES:
-            pass
-        else:
             pass
 
         for idx, child in enumerate(children):
@@ -667,60 +651,60 @@ class ViewScaffolder:
                 if f_name in cls.HIDDEN_FIELDS:
                     continue
 
-                meta_dict = f_meta if isinstance(f_meta, dict) else {}
-                raw_type = meta_dict.get("type", "string")
-                comp_type = cls.TYPE_MAPPING.get(raw_type, "TextInput")
-                comodel = meta_dict.get("comodel") or meta_dict.get("target")
+                    meta_dict = f_meta if isinstance(f_meta, dict) else {}
+                    raw_type = meta_dict.get("type", "string")
+                    comp_type = cls.TYPE_MAPPING.get(raw_type, "TextInput")
+                    comodel = meta_dict.get("comodel") or meta_dict.get("target")
 
-                atom_props = {
-                    "name": f_name,
-                    "label": meta_dict.get("label", f_name.title()),
-                    "options": meta_dict.get("options", []),
-                }
+                    atom_props = {
+                        "name": f_name,
+                        "label": meta_dict.get("label", f_name.title()),
+                        "options": meta_dict.get("options", []),
+                    }
 
-                if comp_type in ["One2ManyLines", "DataGrid"]:
-                    atom_props["data_source"] = f_name
-                    atom_props["comodel"] = comodel
+                    if comp_type in ["One2ManyLines", "DataGrid"]:
+                        atom_props["data_source"] = f_name
+                        atom_props["comodel"] = comodel
 
-                    inverse = meta_dict.get("inverse_name", "")
-                    atom_props["inverse_name"] = inverse
+                        inverse = meta_dict.get("inverse_name", "")
+                        atom_props["inverse_name"] = inverse
 
-                    if comodel:
-                        child_fields = cls._get_model_field_map(comodel)
-                        if child_fields:
-                            child_columns = []
-                            for cf_name, cf_meta in child_fields.items():
-                                if cf_name in cls.HIDDEN_FIELDS or cf_name == inverse:
-                                    continue
+                        if comodel:
+                            child_fields = cls._get_model_field_map(comodel)
+                            if child_fields:
+                                child_columns = []
+                                for cf_name, cf_meta in child_fields.items():
+                                    if cf_name in cls.HIDDEN_FIELDS or cf_name == inverse:
+                                        continue
 
-                                c_meta = cf_meta if isinstance(cf_meta, dict) else {}
-                                child_type = cls.TYPE_MAPPING.get(c_meta.get("type", "string"), "TextInput")
-                                child_column = {
-                                    "field": cf_name,
-                                    "label": c_meta.get("label", cf_name.title()),
-                                    "type": child_type,
-                                }
+                                    c_meta = cf_meta if isinstance(cf_meta, dict) else {}
+                                    child_type = cls.TYPE_MAPPING.get(c_meta.get("type", "string"), "TextInput")
+                                    child_column = {
+                                        "field": cf_name,
+                                        "label": c_meta.get("label", cf_name.title()),
+                                        "type": child_type,
+                                    }
 
-                                child_target = c_meta.get("comodel") or c_meta.get("target")
-                                if child_type == "Many2OneLookup" and child_target:
-                                    child_column["comodel"] = child_target
+                                    child_target = c_meta.get("comodel") or c_meta.get("target")
+                                    if child_type == "Many2OneLookup" and child_target:
+                                        child_column["comodel"] = child_target
 
-                                child_columns.append(child_column)
+                                    child_columns.append(child_column)
 
-                            atom_props["columns"] = child_columns
+                                atom_props["columns"] = child_columns
 
-                    table_components.append({"type": comp_type, "props": atom_props})
+                        table_components.append({"type": comp_type, "props": atom_props})
 
-                elif comp_type == "Many2OneLookup":
-                    atom_props["comodel"] = comodel
-                    generic_fields.append({"type": comp_type, "props": atom_props})
+                    elif comp_type == "Many2OneLookup":
+                        atom_props["comodel"] = comodel
+                        generic_fields.append({"type": comp_type, "props": atom_props})
 
-                elif comp_type == "Many2ManyTags":
-                    atom_props["comodel"] = comodel
-                    generic_fields.append({"type": comp_type, "props": atom_props})
+                    elif comp_type == "Many2ManyTags":
+                        atom_props["comodel"] = comodel
+                        generic_fields.append({"type": comp_type, "props": atom_props})
 
-                else:
-                    generic_fields.append({"type": comp_type, "props": atom_props})
+                    else:
+                        generic_fields.append({"type": comp_type, "props": atom_props})
 
             body_children = [
                 {"type": "Group", "props": {}, "children": generic_fields},

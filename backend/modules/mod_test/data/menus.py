@@ -1,18 +1,27 @@
 # backend/modules/mod_test/data/menus.py
+
 async def init_test_menus(env):
-    Menu = env['ir.ui.menu']
+    loader = env.data
 
-    cat_test = await Menu.create({
-        'name': 'LABORATORIO',
-        'icon': 'Beaker',
-        'sequence': 50,
-        'is_category': True
-    })
+    cat_test = await loader.ensure_menu(
+        "menu_test_root",
+        {
+            "name": "LABORATORIO",
+            "icon": "Beaker",
+            "sequence": 50,
+            "is_category": True,
+        },
+        lookup_domain=[("name", "=", "LABORATORIO"), ("is_category", "=", True)],
+    )
 
-    await Menu.create({
-        'name': 'Registros de Prueba',
-        'parent_id': cat_test.id,
-        'action': 'test.record', 
-        'sequence': 1,
-        'icon': 'Database'
-    })
+    await loader.ensure_menu(
+        "menu_test_records",
+        {
+            "name": "Registros de Prueba",
+            "parent_id": cat_test.id,
+            "action": "test.record",
+            "sequence": 1,
+            "icon": "Database",
+        },
+        lookup_domain=[("name", "=", "Registros de Prueba"), ("parent_id", "=", cat_test.id)],
+    )

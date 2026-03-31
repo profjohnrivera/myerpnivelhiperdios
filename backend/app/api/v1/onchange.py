@@ -16,10 +16,6 @@ router = APIRouter()
 
 
 def _declared_fields_for_model(model_cls) -> Dict[str, Any]:
-    """
-    Devuelve solo campos declarados del modelo.
-    No properties, no helpers, no display_name.
-    """
     if hasattr(model_cls, "_declared_fields"):
         try:
             return model_cls._declared_fields() or {}
@@ -35,9 +31,6 @@ def _declared_fields_for_model(model_cls) -> Dict[str, Any]:
 
 
 def _sanitize_onchange_payload(model_cls, data: dict, model_name: str) -> dict:
-    """
-    Limpia relaciones y luego filtra a SOLO campos declarados.
-    """
     cleaned = _clean_m2o_payload(data or {}, model_name=model_name)
     declared = _declared_fields_for_model(model_cls)
 
@@ -49,12 +42,8 @@ def _sanitize_onchange_payload(model_cls, data: dict, model_name: str) -> dict:
 
 
 async def _deep_trigger_onchanges(record, payload_data: dict):
-    """
-    Dispara onchange del registro y de hijos existentes si el payload toca x2many.
-    """
     declared = _declared_fields_for_model(record.__class__)
 
-    # Recorre hijos anidados solo si el campo realmente existe y es one2many
     for field_name, field_value in payload_data.items():
         field_def = declared.get(field_name)
         if not field_def or not hasattr(field_def, "get_meta"):
@@ -76,7 +65,6 @@ async def _deep_trigger_onchanges(record, payload_data: dict):
                     if i < len(nested_list):
                         await _deep_trigger_onchanges(nested_list[i], item_payload)
 
-    # Dispara onchange methods del propio modelo
     for attr_name in dir(record.__class__):
         method = getattr(record.__class__, attr_name, None)
         if hasattr(method, "_onchange_fields"):
@@ -96,12 +84,6 @@ async def onchange_record(
     payload: dict = Body(...),
     current_user_id: int = Depends(get_current_user),
 ):
-    """
-    Onchange seguro:
-    - solo acepta campos declarados del modelo
-    - no escribe properties/helpers
-    - limpia payload relacional antes de aplicarlo
-    """
     try:
         async with request_env(current_user_id) as (env, session_graph):
             ModelClass = Registry.get_model(model_name)
@@ -128,8 +110,6 @@ async def onchange_record(
                 try:
                     setattr(record, field_name, field_value)
                 except Exception:
-                    # Onchange nunca debe romper por un setter no aplicable;
-                    # solo ignora la mutación inválida y sigue evaluando.
                     pass
 
             await _deep_trigger_onchanges(record, data)

@@ -57,7 +57,7 @@ class Application:
         self.kernel = Kernel(bus=self.bus, graph=self.graph)
 
     async def boot(self, modules: List[Type]) -> None:
-        print("🔌 Application: Initializing infrastructure...")
+        print("🔌 Application: Initializing infrastructure.")
 
         await self.storage.get_pool()
         self.kernel.load_modules(modules)
@@ -65,14 +65,16 @@ class Application:
 
         await self._warm_up_system_config()
         await self.kernel.load_data()
+
+        # CIERRE P2-A:
+        # persistir toda la data de bootstrap antes del boot online
+        await self.storage.save(self.graph)
+
         await self.kernel.boot()
 
     async def _warm_up_system_config(self):
         """
         Carga SOLO ir.config_parameter en el graph maestro.
-
-        Consume el contrato único de get_connection():
-        siempre devuelve un objeto conexión-like.
         """
         try:
             conn = await self.storage.get_connection()

@@ -10,10 +10,13 @@ class SaleOrderService:
     """
     🧠 SERVICIO DE NEGOCIO DE PEDIDOS DE VENTA
 
-    P1-A:
-    - el agregado del pedido vive en el dominio
-    - la API no corrige amount_total por SQL
-    - las líneas pueden mantener sincronizado al padre dentro del graph
+    Responsabilidades:
+    - helpers de líneas
+    - resolución de compañía
+    - preparación de create
+    - sanitización de write
+    - validaciones de confirmación
+    - cálculo de total / invoice_status desde una fuente de verdad consistente
     """
 
     @staticmethod
@@ -42,24 +45,18 @@ class SaleOrderService:
     async def resolve_company_async(cls) -> int | None:
         """
         Resolución async con fallback a BD.
+        Ya no usa contrato ambiguo pool/conn.
         """
         sync_result = cls.resolve_company_from_env()
         if sync_result:
-            return sync_result
+            return int(sync_result)
 
         try:
             from app.core.storage.postgres_storage import PostgresGraphStorage
 
             storage = PostgresGraphStorage()
-            conn_or_pool = await storage.get_connection()
-            query = 'SELECT id FROM "res_company" ORDER BY id LIMIT 1'
-
-            if hasattr(conn_or_pool, "acquire"):
-                async with conn_or_pool.acquire() as conn:
-                    row = await conn.fetchrow(query)
-            else:
-                row = await conn_or_pool.fetchrow(query)
-
+            conn = await storage.get_connection()
+            row = await conn.fetchrow('SELECT id FROM "res_company" ORDER BY id LIMIT 1')
             return int(row["id"]) if row else None
         except Exception:
             return None
@@ -75,193 +72,313 @@ class SaleOrderService:
         except Exception:
             return []
 
-    @classmethod
-    async def get_order_lines(cls, order, allow_db_fallback: bool = False):
-        """
-        Extrae líneas del pedido.
+    @staticmethod
+    def _order_identity(order_value) -> int | None:
+        if not order_value:
+            return None
+        raw = order_value.id if hasattr(order_value, "id") else order_value
+        return int(raw) if str(raw).isdigit() else None
 
-        Estrategia:
-        1. Graph actual (si ya están materializadas)
-        2. Fallback a BD solo cuando se pide explícitamente
-        """
-        lines = getattr(order, "order_line", None)
+    @staticmethod
+    def _is_line_object(line) -> bool:
+        if isinstance(line, dict):
+            return True
 
-        if lines:
+        if hasattr(line, "_get_model_name"):
             try:
-                if hasattr(lines, "load_data"):
-                    await lines.load_data()
+                return line._get_model_name() == "sale.order.line"
             except Exception:
                 pass
 
-            materialized = cls.iter_lines(lines)
-            if materialized:
-                return materialized
+        return hasattr(line, "price_subtotal") or hasattr(line, "order_id") or hasattr(line, "product_uom_qty")
 
-        if not allow_db_fallback:
+    @staticmethod
+    def _line_identity(line) -> str | None:
+        if isinstance(line, dict):
+            raw = line.get("id")
+        elif hasattr(line, "id"):
+            raw = line.id
+        else:
+            raw = None
+
+        if raw in (None, False, ""):
+            return None
+        return str(raw)
+
+    @classmethod
+    def _extract_line_ids(cls, lines) -> List[int]:
+        ids: List[int] = []
+
+        for line in cls.iter_lines(lines):
+            if isinstance(line, dict):
+                raw = line.get("id")
+            elif hasattr(line, "id"):
+                raw = line.id
+            else:
+                raw = line
+
+            if str(raw).isdigit():
+                ids.append(int(raw))
+
+        unique_ids = []
+        seen = set()
+        for lid in ids:
+            if lid not in seen:
+                unique_ids.append(lid)
+                seen.add(lid)
+        return unique_ids
+
+    @classmethod
+    async def _load_lines_by_ids(cls, line_ids: List[int], graph=None):
+        if not line_ids:
             return []
 
         SaleOrderLineModel = Registry.get_model("sale.order.line")
         if not SaleOrderLineModel:
             return []
 
-        try:
-            rs = await SaleOrderLineModel.search(
-                [("order_id", "=", order.id)],
-                context=order.graph,
-            )
-            if rs and hasattr(rs, "load_data"):
-                await rs.load_data()
-            return cls.iter_lines(rs)
-        except PermissionError:
+        rs = await SaleOrderLineModel.search([("id", "in", line_ids)], context=graph)
+        if rs and hasattr(rs, "load_data"):
+            await rs.load_data()
+
+        materialized = cls.iter_lines(rs)
+        by_id = {}
+        for line in materialized:
+            if hasattr(line, "id") and str(line.id).isdigit():
+                by_id[int(line.id)] = line
+
+        return [by_id[lid] for lid in line_ids if lid in by_id]
+
+    @classmethod
+    async def _load_order_record(cls, order_value, graph=None):
+        order_id = cls._order_identity(order_value)
+        if not order_id:
+            return None
+
+        OrderModel = Registry.get_model("sale.order")
+        if not OrderModel:
+            return None
+
+        rs = await OrderModel.search([("id", "=", order_id)], context=graph)
+        if rs and hasattr(rs, "load_data"):
+            await rs.load_data()
+
+        return rs[0] if rs and len(rs) > 0 else None
+
+    @classmethod
+    def _graph_lines_for_order(cls, order_id: int, graph) -> List:
+        """
+        Extrae líneas vivas del graph actual, incluyendo líneas nuevas todavía
+        no persistidas.
+        """
+        if not graph or not str(order_id).isdigit():
             return []
+
+        SaleOrderLineModel = Registry.get_model("sale.order.line")
+        if not SaleOrderLineModel:
+            return []
+
+        values = getattr(graph, "_values", None)
+        if values is None or not hasattr(values, "keys"):
+            return []
+
+        env = Context.get_env()
+        found = []
+        seen = set()
+
+        for key in list(values.keys()):
+            if not (isinstance(key, tuple) and len(key) == 3):
+                continue
+            if key[0] != "sale.order.line" or key[2] != "order_id":
+                continue
+
+            line_id = key[1]
+            raw_order = values.get(key)
+
+            resolved_order_id = None
+            if hasattr(raw_order, "id"):
+                resolved_order_id = cls._order_identity(raw_order.id)
+            else:
+                resolved_order_id = cls._order_identity(raw_order)
+
+            if resolved_order_id != int(order_id):
+                continue
+
+            if line_id in seen:
+                continue
+
+            seen.add(line_id)
+            found.append(SaleOrderLineModel(_id=line_id, context=graph, env=env))
+
+        return found
+
+    @classmethod
+    def _merge_line_sources(cls, *collections) -> List:
+        """
+        Merge estable por id:
+        - fuentes posteriores pisan a las anteriores
+        - graph gana sobre DB
+        """
+        merged = {}
+        anon_idx = 0
+
+        for collection in collections:
+            for line in cls.iter_lines(collection):
+                key = cls._line_identity(line)
+                if key is None:
+                    key = f"anon:{anon_idx}"
+                    anon_idx += 1
+                merged[key] = line
+
+        return list(merged.values())
+
+    @classmethod
+    async def get_order_lines(cls, order, allow_db_fallback: bool = True):
+        """
+        Fuente de verdad correcta:
+        - pedido NUEVO (id temporal): usar relación en memoria
+        - pedido persistido: usar DB + graph actual
+        """
+        graph = getattr(order, "graph", None)
+        order_id = cls._order_identity(getattr(order, "id", None))
+
+        # Pedido virtual/new: solo memoria
+        if not str(order_id).isdigit():
+            lines = getattr(order, "order_line", None)
+
+            if lines:
+                try:
+                    if hasattr(lines, "load_data"):
+                        await lines.load_data()
+                except Exception:
+                    pass
+
+                materialized = cls.iter_lines(lines)
+
+                if materialized:
+                    if all(cls._is_line_object(item) for item in materialized):
+                        return materialized
+
+                    line_ids = cls._extract_line_ids(materialized)
+                    if line_ids:
+                        resolved = await cls._load_lines_by_ids(line_ids, graph=graph)
+                        if resolved:
+                            return resolved
+
+            return []
+
+        # Pedido persistido: DB + graph
+        db_lines = []
+        if allow_db_fallback:
+            SaleOrderLineModel = Registry.get_model("sale.order.line")
+            if SaleOrderLineModel:
+                try:
+                    rs = await SaleOrderLineModel.search(
+                        [("order_id", "=", int(order_id))],
+                        context=graph,
+                    )
+                    if rs and hasattr(rs, "load_data"):
+                        await rs.load_data()
+                    db_lines = cls.iter_lines(rs)
+                except PermissionError:
+                    db_lines = []
+
+        graph_lines = cls._graph_lines_for_order(int(order_id), graph)
+
+        return cls._merge_line_sources(db_lines, graph_lines)
 
     @staticmethod
     def is_commercial_line(line) -> bool:
         if isinstance(line, dict):
             return not line.get("display_type")
-        return not getattr(line, "display_type", None)
+
+        if hasattr(line, "display_type"):
+            return not getattr(line, "display_type", None)
+
+        return False
 
     @staticmethod
     def line_subtotal(line) -> float:
         if isinstance(line, dict):
             return float(line.get("price_subtotal", 0.0) or 0.0)
-        return float(getattr(line, "price_subtotal", 0.0) or 0.0)
+
+        if hasattr(line, "price_subtotal"):
+            return float(getattr(line, "price_subtotal", 0.0) or 0.0)
+
+        return 0.0
 
     @staticmethod
     def line_invoice_status(line) -> str:
         if isinstance(line, dict):
             return str(line.get("invoice_status", "no") or "no")
-        return str(getattr(line, "invoice_status", "no") or "no")
 
-    @staticmethod
-    def line_id(line) -> str | None:
-        if isinstance(line, dict):
-            raw = line.get("id")
-        else:
-            raw = getattr(line, "id", None)
+        if hasattr(line, "invoice_status"):
+            return str(getattr(line, "invoice_status", "no") or "no")
 
-        if raw is None:
-            return None
-        return str(raw)
+        return "no"
 
     @classmethod
-    def _calculate_aggregates(cls, order, lines) -> tuple[float, str]:
-        """
-        Calcula amount_total e invoice_status a partir de una colección de líneas.
-        No toca BD.
-        """
-        total = 0.0
-        line_statuses = set()
-
-        for line in cls.iter_lines(lines):
-            if cls.is_commercial_line(line):
-                total += cls.line_subtotal(line)
-                line_statuses.add(cls.line_invoice_status(line))
+    def _apply_aggregate_result(cls, order, total: float, line_statuses: set[str]):
+        order.amount_total = float(total or 0.0)
 
         current_state = getattr(order, "state", "draft")
-
         if current_state not in ["sale", "done"]:
-            invoice_status = "no"
+            order.invoice_status = "no"
         elif "to invoice" in line_statuses:
-            invoice_status = "to invoice"
+            order.invoice_status = "to invoice"
         elif line_statuses and all(status == "invoiced" for status in line_statuses):
-            invoice_status = "invoiced"
+            order.invoice_status = "invoiced"
         elif line_statuses and all(status in ["invoiced", "upselling"] for status in line_statuses):
-            invoice_status = "upselling"
+            order.invoice_status = "upselling"
         else:
-            invoice_status = "no"
-
-        return float(total), invoice_status
+            order.invoice_status = "no"
 
     @classmethod
     def recompute_onchange_total(cls, order):
-        total, _ = cls._calculate_aggregates(
-            order,
-            cls.iter_lines(getattr(order, "order_line", [])),
-        )
-        order.amount_total = total
+        """
+        Onchange puro de UI:
+        usa solo lo que ya esté en memoria del formulario.
+        """
+        total = 0.0
+        statuses = set()
+
+        for line in cls.iter_lines(getattr(order, "order_line", [])):
+            if not cls._is_line_object(line):
+                continue
+            if cls.is_commercial_line(line):
+                total += cls.line_subtotal(line)
+                statuses.add(cls.line_invoice_status(line))
+
+        cls._apply_aggregate_result(order, total, statuses)
 
     @classmethod
     async def compute_total_and_invoice_status(cls, order):
         """
-        Compute oficial del pedido.
+        Recompute robusto:
+        nunca se queda solo con una relación mal materializada.
         """
-        lines = await cls.get_order_lines(order, allow_db_fallback=False)
-        total, invoice_status = cls._calculate_aggregates(order, lines)
-
-        order.amount_total = total
-        order.invoice_status = invoice_status
-
-    @classmethod
-    def _merge_or_append_current_line(cls, lines: List, current_line) -> List:
-        """
-        Reemplaza la versión persistida de una línea por su versión viva
-        en el graph, o la agrega si todavía no existe en BD.
-        """
-        current_id = cls.line_id(current_line)
-        if current_id is None:
-            return list(lines)
-
-        merged = []
-        replaced = False
-
-        for line in cls.iter_lines(lines):
-            if cls.line_id(line) == current_id:
-                merged.append(current_line)
-                replaced = True
-            else:
-                merged.append(line)
-
-        if not replaced:
-            merged.append(current_line)
-
-        return merged
-
-    @classmethod
-    def _remove_line_from_collection(cls, lines: List, line_to_remove) -> List:
-        remove_id = cls.line_id(line_to_remove)
-        if remove_id is None:
-            return list(lines)
-
-        return [line for line in cls.iter_lines(lines) if cls.line_id(line) != remove_id]
-
-    @classmethod
-    async def sync_order_aggregates_for_line(
-        cls,
-        line,
-        *,
-        removing: bool = False,
-        explicit_order=None,
-    ) -> None:
-        """
-        Sincroniza amount_total e invoice_status del pedido padre
-        desde el dominio, sin SQL correctivo en la API.
-
-        Estrategia:
-        - toma las líneas persistidas visibles para el pedido
-        - fusiona o elimina la línea viva del graph según corresponda
-        - recalcula agregados y los deja marcados en el graph del pedido
-        """
-        order = explicit_order or getattr(line, "order_id", None)
-        if not order:
-            return
-
-        # Para pedidos nuevos no persistidos, el create padre volverá a calcular
-        # correctamente al final del flujo. Aquí no forzamos fallback extraño.
-        if not str(getattr(order, "id", "")).isdigit():
-            return
+        total = 0.0
+        line_statuses = set()
 
         lines = await cls.get_order_lines(order, allow_db_fallback=True)
 
-        if removing:
-            effective_lines = cls._remove_line_from_collection(lines, line)
-        else:
-            effective_lines = cls._merge_or_append_current_line(lines, line)
+        for line in lines:
+            if cls.is_commercial_line(line):
+                total += cls.line_subtotal(line)
+                line_statuses.add(cls.line_invoice_status(line))
 
-        total, invoice_status = cls._calculate_aggregates(order, effective_lines)
+        cls._apply_aggregate_result(order, total, line_statuses)
 
-        order.amount_total = total
-        order.invoice_status = invoice_status
+    @classmethod
+    async def recompute_parent_from_value(cls, order_value, graph=None):
+        """
+        Recalcula el agregado del pedido padre y lo deja dirty en el graph actual.
+        """
+        order = await cls._load_order_record(order_value, graph=graph)
+        if not order:
+            return
+
+        await cls.compute_total_and_invoice_status(order)
 
     @staticmethod
     def check_company_consistency(order):

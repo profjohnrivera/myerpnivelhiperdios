@@ -15,7 +15,7 @@ from app.core.ormcache import ormcache
 from .fields import Field, One2manyField
 from .recordset import Recordset
 from .savepoint import AsyncGraphSavepoint
-
+from app.core.clock import utc_now_iso
 
 class Model:
     _name = None
@@ -50,12 +50,6 @@ class Model:
     @classmethod
     @ormcache("ir.ui.view")
     async def get_view(cls, view_type: str = "form"):
-        """
-        Runtime oficial de vistas:
-        - explícita en código si existe
-        - implícita generada si no existe explícita
-        - NO consulta ir.ui.view como fuente canónica de ejecución
-        """
         from app.core.scaffolder import ViewScaffolder
         return await ViewScaffolder.get_runtime_view(cls._get_model_name(), view_type)
 
@@ -72,10 +66,6 @@ class Model:
 
     @classmethod
     def _declared_fields(cls) -> Dict[str, Field]:
-        """
-        Devuelve únicamente los campos declarados del modelo.
-        No incluye properties, helpers ni atributos runtime.
-        """
         result: Dict[str, Field] = {}
         for name in dir(cls):
             attr = getattr(cls, name, None)
@@ -85,10 +75,6 @@ class Model:
 
     @classmethod
     def _sanitize_input_vals(cls, vals: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Acepta solo campos declarados del modelo.
-        Bloquea display_name y cualquier atributo de presentación/propiedad.
-        """
         vals = dict(vals or {})
         declared = cls._declared_fields()
 
@@ -143,10 +129,12 @@ class Model:
             return
 
         from app.core.storage.postgres_storage import PostgresGraphStorage
+        from app.core.registry import Registry
 
         storage = PostgresGraphStorage()
         conn = await storage.get_connection()
         table_name = cls._get_model_name().replace(".", "_")
+        fields_meta = Registry.get_schema_fields_for_model(cls._get_model_name())
 
         pg_types = {
             "string": "VARCHAR(255)",
@@ -171,9 +159,6 @@ class Model:
                 "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)",
                 table_name,
             )
-
-            from app.core.registry import Registry
-            fields_meta = Registry.get_schema_fields_for_model(cls._get_model_name())
 
             if not table_exists:
                 print(f"🛠️ [DDL] Evolución Inicial: Creando tabla {table_name}...")
@@ -258,7 +243,7 @@ class Model:
 
         model_name = cls._get_model_name()
         env = Context.get_env()
-        now = datetime.datetime.utcnow().isoformat()
+        now = utc_now_iso()
         graph = context if context else (Context.get_graph() or Graph())
 
         async with AsyncGraphSavepoint(env):

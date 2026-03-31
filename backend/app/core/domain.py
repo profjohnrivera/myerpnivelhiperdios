@@ -1,40 +1,12 @@
 # backend/app/core/domain.py
-# ============================================================
-# COMPILADOR DE DOMINIOS — ARQUITECTURA DEFINITIVA
-#
-# Traduce dominios estilo Odoo a SQL parametrizado.
-# Dos modos:
-#   compile_sql()  → SQL para PostgreSQL via asyncpg
-#   check()        → evaluación en RAM (para filtros in-memory)
-#
-# Soporte completo:
-#   - Operadores: =, !=, >, <, >=, <=, in, not in, like, ilike,
-#                 not like, not ilike, =?, child_of, parent_of
-#   - NULL semántico: ("field", "=", False/None) → IS NULL
-#                     ("field", "!=", False/None) → IS NOT NULL
-#   - Notación punto: ("order_id.create_uid", "=", 3) → LEFT JOIN
-#   - Operadores lógicos: & (AND), | (OR), ! (NOT)
-#   - AND implícito: lista de leaves sin operadores explícitos
-# ============================================================
 
 from typing import List, Tuple, Any, Dict, Union
 
 
-# Valor centinela para detectar NULL semántico en dominios Odoo.
-# En Odoo: ("field", "=", False) significa "campo es NULL o False".
-# En SQL: WHERE field IS NULL
 _NULL_SENTINELS = (None, False)
 
 
 class DomainEngine:
-    """
-    🧠 EL COMPILADOR DE DOMINIOS (AST → SQL + RAM)
-    """
-
-    # =========================================================================
-    # EVALUACIÓN EN RAM
-    # =========================================================================
-
     @staticmethod
     def _get_nested_value(record_instance: Any, field_path: str) -> Any:
         parts = field_path.split(".")
@@ -53,7 +25,9 @@ class DomainEngine:
 
     @staticmethod
     def _evaluate_leaf(
-        leaf: Tuple, record_data: Dict[str, Any], record_instance: Any = None
+        leaf: Tuple,
+        record_data: Dict[str, Any],
+        record_instance: Any = None,
     ) -> bool:
         if len(leaf) != 3:
             return False
@@ -74,14 +48,16 @@ class DomainEngine:
             if isinstance(value, str) and value.isdigit():
                 value = int(value)
             elif isinstance(value, (list, tuple, set)):
-                value = [int(v) if isinstance(v, str) and v.isdigit() else v for v in value]
+                value = [
+                    int(v) if isinstance(v, str) and v.isdigit() else v
+                    for v in value
+                ]
 
         op = str(operator).lower()
 
         if op == "=?":
             return record_value in _NULL_SENTINELS or record_value == value
 
-        # NULL semántico en RAM: False/None significa "vacío"
         if op == "=" and value in _NULL_SENTINELS:
             return record_value in _NULL_SENTINELS
         if op == "!=" and value in _NULL_SENTINELS:
@@ -126,7 +102,6 @@ class DomainEngine:
         domain: List[Union[str, Tuple]],
         record_instance: Any = None,
     ) -> bool:
-        """Evalúa un dominio en RAM. Soporta AND implícito y prefija."""
         if not domain:
             return True
 
@@ -157,30 +132,11 @@ class DomainEngine:
 
         return all(stack) if stack else True
 
-    # =========================================================================
-    # COMPILACIÓN A SQL
-    # =========================================================================
-
     @staticmethod
     def compile_sql(
-        domain: List[Union[str, Tuple]], base_model: str
+        domain: List[Union[str, Tuple]],
+        base_model: str,
     ) -> Tuple[str, str, List[Any]]:
-        """
-        Compila dominio Odoo a SQL parametrizado para asyncpg.
-
-        Retorna: (joins_sql, where_sql, params)
-
-        NULL SEMÁNTICO (estándar Odoo):
-          ("partner_id", "=", False)  → WHERE partner_id IS NULL
-          ("partner_id", "!=", False) → WHERE partner_id IS NOT NULL
-          ("partner_id", "=", None)   → WHERE partner_id IS NULL
-          ("partner_id", "!=", None)  → WHERE partner_id IS NOT NULL
-
-        Esto es correcto porque en PostgreSQL:
-          column = NULL  → siempre FALSE (SQL ternario)
-          column IS NULL → correcto
-        asyncpg no puede enviar NULL como parámetro para comparación =.
-        """
         if not domain:
             return "", "", []
 
@@ -200,6 +156,9 @@ class DomainEngine:
             s = str(raw or "")
             return s if ("%" in s or "_" in s) else f"%{s}%"
 
+        def schema_fields(model_name: str) -> Dict[str, Any]:
+            return Registry.get_schema_fields_for_model(model_name)
+
         def process_leaf(leaf: Tuple) -> str:
             if len(leaf) != 3:
                 return "TRUE"
@@ -207,19 +166,17 @@ class DomainEngine:
             field_path, op, value = leaf
             op_str = str(op).lower()
 
-            # =? → TRUE si value es NULL/vacío, sino trata como =
             if op_str == "=?":
                 if value in _NULL_SENTINELS or value == "":
                     return "TRUE"
                 op_str = "="
 
-            # --- Resolver ruta con notación punto (auto-JOINs) ---
             parts = field_path.split(".")
             current_model = base_model
             current_alias = "t0"
 
             for rel_field in parts[:-1]:
-                fields_cfg = Registry.get_fields_for_model(current_model)
+                fields_cfg = schema_fields(current_model)
                 meta = fields_cfg.get(rel_field, {})
                 target_model = meta.get("target") or meta.get("relation")
                 if not target_model:
@@ -227,6 +184,7 @@ class DomainEngine:
                         f"Domain Compiler Error: Relación '{rel_field}' "
                         f"no existe en '{current_model}'"
                     )
+
                 join_key = (current_alias, rel_field)
                 if join_key not in join_map:
                     alias = get_alias()
@@ -236,11 +194,12 @@ class DomainEngine:
                         f'LEFT JOIN "{target_table}" {alias} '
                         f'ON {current_alias}."{rel_field}" = {alias}.id'
                     )
+
                 current_alias = join_map[join_key]
                 current_model = target_model
 
             final_field = parts[-1]
-            fields_cfg = Registry.get_fields_for_model(current_model)
+            fields_cfg = schema_fields(current_model)
             is_native = final_field in fields_cfg or final_field == "id"
             f_type = (
                 fields_cfg.get(final_field, {}).get("type")
@@ -254,10 +213,6 @@ class DomainEngine:
                 else f"{current_alias}.x_ext->>'{final_field}'"
             )
 
-            # ── NULL semántico (Odoo estándar) ────────────────────────────
-            # ("field", "=", False/None)  → IS NULL
-            # ("field", "!=", False/None) → IS NOT NULL
-            # No se puede enviar NULL como parámetro asyncpg para comparación =
             if value in _NULL_SENTINELS and op_str in ("=", "!="):
                 return (
                     f"{field_ref} IS NULL"
@@ -265,7 +220,6 @@ class DomainEngine:
                     else f"{field_ref} IS NOT NULL"
                 )
 
-            # ── Normalización de tipos para columnas numéricas/relacionales ─
             is_numeric = (
                 f_type in ("relation", "many2one", "integer", "int")
                 or final_field == "id"
@@ -284,12 +238,13 @@ class DomainEngine:
                 elif isinstance(value, str) and value.isdigit():
                     value = int(value)
                 elif isinstance(value, str) and op_str not in (
-                    "like", "ilike", "not like", "not ilike"
+                    "like",
+                    "ilike",
+                    "not like",
+                    "not ilike",
                 ):
-                    # String no numérico para campo entero → nunca coincide
                     return "FALSE"
 
-            # ── child_of / parent_of ─────────────────────────────────────
             if op_str in ("child_of", "parent_of"):
                 if isinstance(value, (list, tuple, set)):
                     value = [int(v) for v in value if str(v).isdigit()]
@@ -302,14 +257,12 @@ class DomainEngine:
                 params.append(value)
                 return f"{field_ref} = ${len(params)}"
 
-            # ── ILIKE / LIKE normalización ────────────────────────────────
             if op_str in ("like", "ilike", "not like", "not ilike"):
                 value = normalize_like(value)
 
             params.append(value)
             idx = len(params)
 
-            # ── Operadores de comparación simples ─────────────────────────
             if op_str == "=":
                 return f"{field_ref} = ${idx}"
             if op_str == "!=":
@@ -323,13 +276,8 @@ class DomainEngine:
             if op_str == "<=":
                 return f"{field_ref} <= ${idx}"
 
-            # ── IN / NOT IN ───────────────────────────────────────────────
             if op_str in ("in", "not in"):
-                cast = (
-                    "bigint[]"
-                    if is_numeric
-                    else "text[]"
-                )
+                cast = "bigint[]" if is_numeric else "text[]"
                 if not isinstance(value, (list, tuple, set)):
                     params[-1] = [value]
                 return (
@@ -338,7 +286,6 @@ class DomainEngine:
                     else f"{field_ref} != ALL(${idx}::{cast})"
                 )
 
-            # ── LIKE variants ─────────────────────────────────────────────
             if op_str == "like":
                 return f"{field_ref} LIKE ${idx}"
             if op_str == "ilike":
@@ -350,13 +297,11 @@ class DomainEngine:
 
             raise ValueError(f"Operador de dominio no soportado: '{op}'")
 
-        # ── Compilación del árbol de dominio ─────────────────────────────
         has_explicit_ops = any(
             isinstance(item, str) and item in ("&", "|", "!") for item in domain
         )
 
         if not has_explicit_ops:
-            # AND implícito entre todos los leaves
             leaves_sql = [
                 process_leaf(item)
                 for item in domain
@@ -364,7 +309,6 @@ class DomainEngine:
             ]
             return " ".join(joins), " AND ".join(leaves_sql), params
 
-        # Notación prefija Odoo (Polish notation): recorrido inverso
         stack: List[str] = []
         for item in reversed(domain):
             if isinstance(item, str):

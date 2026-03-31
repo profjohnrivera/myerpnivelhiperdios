@@ -1,5 +1,6 @@
 # backend/app/core/registry.py
 from typing import Dict, Type, Any, List, Optional
+import os
 import re
 
 
@@ -17,6 +18,7 @@ class Registry:
     - Registrar OTRA clase distinta con el mismo nombre técnico rompe.
     - Después de freeze(), ya no se permiten cambios de schema/metamodelo.
     - El plano UI (views/menus) sigue abierto después de freeze().
+    - get_fields_for_model() es un alias legacy PROHIBIDO por defecto.
     """
 
     _models: Dict[str, Type] = {}
@@ -34,6 +36,7 @@ class Registry:
     _modules: Dict[str, Dict[str, Any]] = {}
 
     _frozen: bool = False
+    _legacy_alias_warned: bool = False
 
     @classmethod
     def reset(cls):
@@ -52,6 +55,7 @@ class Registry:
         cls._modules = {}
 
         cls._frozen = False
+        cls._legacy_alias_warned = False
 
     # =========================================================================
     # 🔒 CICLO DE VIDA CONSTITUCIONAL
@@ -199,10 +203,33 @@ class Registry:
         cls._ensure_field_buckets(tech_name)
         cls._schema_fields[tech_name].pop(field_name, None)
 
-    # Backward compatibility: mantener semántica antigua = schema
+    # Backward compatibility explícita:
+    # register_field queda como alias semántico de schema field.
     @classmethod
     def register_field(cls, model_name: str, field_name: str, metadata: Dict):
         cls.register_schema_field(model_name, field_name, metadata)
+
+    @classmethod
+    def _legacy_alias_allowed(cls) -> bool:
+        """
+        Solo para migración controlada.
+        En producción seria, esto debe estar apagado.
+        """
+        return os.getenv("ERP_ALLOW_LEGACY_REGISTRY_ALIAS", "").strip() == "1"
+
+    @classmethod
+    def _raise_legacy_alias_error(cls, tech_name: str):
+        raise RuntimeError(
+            "❌ Registry.get_fields_for_model() está prohibido por ambigüedad.\n"
+            f"Modelo solicitado: '{tech_name}'.\n\n"
+            "Usa uno de estos métodos explícitos:\n"
+            " - Registry.get_runtime_fields_for_model(model)\n"
+            " - Registry.get_technical_fields_for_model(model)\n"
+            " - Registry.get_schema_fields_for_model(model)\n\n"
+            "Solo si estás en migración temporal, exporta:\n"
+            " ERP_ALLOW_LEGACY_REGISTRY_ALIAS=1\n"
+            "pero no lo dejes activo de forma permanente."
+        )
 
     # =========================================================================
     # 🧬 MODELOS
@@ -214,9 +241,6 @@ class Registry:
         inherit_target = getattr(model_cls, "_inherit", None)
         tech_name = getattr(model_cls, "_name", None) or cls._resolve_name(class_name)
 
-        # -------------------------
-        # HERENCIA TÉCNICA (_inherit)
-        # -------------------------
         if inherit_target:
             target_tech = cls._resolve_name(inherit_target)
 
@@ -248,9 +272,6 @@ class Registry:
             cls._scan_behaviors(target_tech, base_class)
             return
 
-        # -------------------------
-        # REGISTRO DE MODELO BASE
-        # -------------------------
         if tech_name in cls._models:
             existing_cls = cls._models[tech_name]
 
@@ -375,11 +396,29 @@ class Registry:
         tech_name = cls._resolve_name(tech_name)
         return dict(cls._schema_fields.get(tech_name, {}))
 
-    # Backward compatibility:
-    # el contrato viejo se mantiene apuntando a schema_fields
     @classmethod
     def get_fields_for_model(cls, tech_name: str):
-        return cls.get_schema_fields_for_model(tech_name)
+        """
+        Alias legacy PROHIBIDO.
+
+        Durante migración temporal puede habilitarse con:
+            ERP_ALLOW_LEGACY_REGISTRY_ALIAS=1
+
+        Pero el objetivo es eliminar TODOS sus consumidores.
+        """
+        tech_name = cls._resolve_name(tech_name)
+
+        if cls._legacy_alias_allowed():
+            if not cls._legacy_alias_warned:
+                print(
+                    "⚠️ [REGISTRY] get_fields_for_model() está funcionando en modo legacy. "
+                    "Migra todos los callers a runtime/technical/schema y apaga "
+                    "ERP_ALLOW_LEGACY_REGISTRY_ALIAS cuanto antes."
+                )
+                cls._legacy_alias_warned = True
+            return cls.get_schema_fields_for_model(tech_name)
+
+        cls._raise_legacy_alias_error(tech_name)
 
     @classmethod
     def get_all_runtime_fields(cls):
@@ -395,6 +434,10 @@ class Registry:
 
     @classmethod
     def get_all_fields(cls):
+        """
+        Alias legacy explícito.
+        Mantenido solo para tooling temporal; semánticamente equivale a schema_fields.
+        """
         return cls.get_all_schema_fields()
 
     @classmethod

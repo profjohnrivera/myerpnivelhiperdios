@@ -1,43 +1,31 @@
 # backend/app/core/worker.py
-# ============================================================
-# WORKER ENGINE — ARQUITECTURA DEFINITIVA
-#
-# FIX P1-C:
-# - Contexto técnico aislado con env_scope()
-# - Sin Context.set_env()/restore manual en enqueue y ejecución
-# - Sin graph duplicado accidental
-# - Timestamps consistentes
-# - Conserva SKIP LOCKED + retry + DLQ + LISTEN/NOTIFY
-# ============================================================
 
 import asyncio
 import traceback
 import json
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from app.core.registry import Registry
+from app.core.clock import utc_now_naive
 
 
 # retry 1 → 30s, retry 2 → 60s, retry 3 → 120s
 _RETRY_BASE_SECONDS = 30
 
 
-def _utcnow_naive() -> datetime:
-    """
-    UTC naive compatible con columnas TIMESTAMP de Postgres.
-    """
-    return datetime.utcnow()
-
-
 class WorkerEngine:
     """
     🏗️ MOTOR DE TRABAJOS ASÍNCRONOS
 
-    Consume ir.queue con garantías de:
-    - Exactly-once delivery (SKIP LOCKED)
+    Garantías constitucionales:
+    - Exactly-once claim lógico por SKIP LOCKED
     - Recovery automático de jobs huérfanos
     - Retry con backoff exponencial
     - DLQ cuando se agotan los reintentos
+    - Persistencia REAL del graph del job antes de marcarlo done
+    - Persistencia best-effort del graph también en rama de error,
+      para no perder side effects deliberados del propio job
+      (ej. contadores de intento para la suite constitucional)
     """
 
     _running: bool = False
@@ -60,11 +48,6 @@ class WorkerEngine:
     ) -> int:
         """
         📥 Encola un job en Postgres de forma aislada del graph actual.
-
-        FIX P1-C:
-        - graph técnico propio
-        - env técnico scoped
-        - no contamina el ContextVar del caller
         """
         from app.core.env import Env, env_scope
         from app.core.storage.postgres_storage import PostgresGraphStorage
@@ -74,14 +57,17 @@ class WorkerEngine:
         isolated_env = Env(
             user_id="system",
             graph=isolated_graph,
-            context={"disable_audit": True},
+            context={
+                "disable_audit": True,
+                "skip_optimistic_lock": True,
+            },
             su=True,
             _skip_autoset=True,
         )
 
         async with env_scope(isolated_env):
             IrQueue = Registry.get_model("ir.queue")
-            now_val = _utcnow_naive()
+            now_val = utc_now_naive()
 
             tarea = await IrQueue.create({
                 "model_name": model_name,
@@ -92,7 +78,7 @@ class WorkerEngine:
                 "max_retries": max_retries,
                 "retries": 0,
                 "state": "pending",
-                "scheduled_at": now_val.isoformat(),
+                "scheduled_at": now_val,
             })
 
             storage = PostgresGraphStorage()
@@ -100,11 +86,7 @@ class WorkerEngine:
             real_id = id_mapping.get(str(tarea.id), tarea.id)
 
             print(f"   📥 Worker: '{model_name}.{method_name}' encolado [ID: {real_id}]")
-            return real_id
-
-    # =========================================================================
-    # BUCLE PRINCIPAL
-    # =========================================================================
+            return int(real_id)
 
     @classmethod
     async def run(cls):
@@ -112,9 +94,9 @@ class WorkerEngine:
         👷 Bucle event-driven del Worker.
 
         Ciclo:
-        1. Al arrancar: recuperar jobs huérfanos ('started' → 'retry')
-        2. Procesar todos los jobs disponibles ('pending' + 'retry' vencidos)
-        3. Dormir esperando NOTIFY o timeout de 60s
+        1. Al arrancar: recuperar jobs huérfanos ('started' → 'retry' / 'failed')
+        2. Procesar jobs disponibles
+        3. Dormir esperando NOTIFY o timeout
         4. Despertar y repetir
         """
         from app.core.storage.postgres_storage import PostgresGraphStorage
@@ -161,6 +143,55 @@ class WorkerEngine:
         cls._running = False
         if cls._wakeup_event:
             cls._wakeup_event.set()
+
+    @classmethod
+    async def wait_stopped(cls, timeout: float = 1.0):
+        task = cls._runner_task
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+            except Exception:
+                pass
+
+    @classmethod
+    async def recover_orphaned_jobs(cls):
+        """
+        API pública para tests / mantenimiento.
+        """
+        from app.core.storage.postgres_storage import PostgresGraphStorage
+
+        storage = PostgresGraphStorage()
+        pool = await storage.get_pool()
+        await cls._recover_orphaned_jobs(pool)
+
+    @classmethod
+    async def drain_available_jobs(cls, *, recover_orphans: bool = True, max_jobs: int | None = None) -> int:
+        """
+        API pública determinista para tests / mantenimiento.
+        Procesa jobs disponibles sin arrancar el loop infinito.
+        """
+        from app.core.storage.postgres_storage import PostgresGraphStorage
+
+        storage = PostgresGraphStorage()
+        pool = await storage.get_pool()
+
+        processed = 0
+
+        if recover_orphans:
+            await cls._recover_orphaned_jobs(pool)
+
+        while True:
+            if max_jobs is not None and processed >= max_jobs:
+                break
+
+            job = await cls._claim_next_job(pool)
+            if not job:
+                break
+
+            await cls._execute_job(pool, job)
+            processed += 1
+
+        return processed
 
     # =========================================================================
     # INTERNOS
@@ -245,6 +276,7 @@ class WorkerEngine:
         """
         from app.core.env import Env, env_scope
         from app.core.graph import Graph
+        from app.core.storage.postgres_storage import PostgresGraphStorage
 
         job_id = job["id"]
         model_name = job["model_name"]
@@ -257,12 +289,16 @@ class WorkerEngine:
         job_env = Env(
             user_id="system",
             graph=Graph(),
-            context={"disable_audit": True},
+            context={
+                "disable_audit": True,
+                "skip_optimistic_lock": True,
+            },
             su=True,
             _skip_autoset=True,
         )
 
-        start = _utcnow_naive()
+        storage = PostgresGraphStorage()
+        start = utc_now_naive()
 
         try:
             async with env_scope(job_env):
@@ -273,16 +309,21 @@ class WorkerEngine:
                 if not TargetModel:
                     raise LookupError(f"El modelo '{model_name}' no está registrado.")
 
-                if not hasattr(TargetModel, method_name):
-                    raise AttributeError(
-                        f"El modelo '{model_name}' no expone el método '{method_name}'"
-                    )
-
                 if "record_id" in kwargs:
                     record_id = kwargs.pop("record_id")
                     record = TargetModel(_id=record_id, context=job_env.graph, env=job_env)
+
+                    if not hasattr(record, method_name):
+                        raise AttributeError(
+                            f"El registro '{model_name}' no expone el método '{method_name}'"
+                        )
+
                     method = getattr(record, method_name)
                 else:
+                    if not hasattr(TargetModel, method_name):
+                        raise AttributeError(
+                            f"El modelo '{model_name}' no expone el método '{method_name}'"
+                        )
                     method = getattr(TargetModel, method_name)
 
                 if asyncio.iscoroutinefunction(method):
@@ -292,7 +333,10 @@ class WorkerEngine:
                     if asyncio.iscoroutine(result):
                         await result
 
-            duration = (_utcnow_naive() - start).total_seconds()
+                # job exitoso: persistir mutaciones reales antes de marcar done
+                await storage.save(job_env.graph)
+
+            duration = (utc_now_naive() - start).total_seconds()
 
             async with pool.acquire() as conn:
                 await conn.execute(
@@ -307,10 +351,22 @@ class WorkerEngine:
             error_trace = traceback.format_exc()
             new_retries = retries + 1
 
+            # CONSTITUCIONAL:
+            # persistir best-effort efectos intencionales del job fallido
+            # (ej. contadores, marcas diagnósticas, etc.)
+            try:
+                await storage.save(job_env.graph)
+            except Exception as persist_error:
+                error_trace += (
+                    "\n\n[PERSISTENCE WARNING] No se pudo persistir graph parcial del job fallido:\n"
+                    f"{traceback.format_exc()}"
+                )
+                print(f"   ⚠️  [{job_id}] warning persistiendo graph fallido: {persist_error}")
+
             async with pool.acquire() as conn:
                 if new_retries <= max_retries:
                     delay_seconds = _RETRY_BASE_SECONDS * (2 ** (new_retries - 1))
-                    retry_at = _utcnow_naive() + timedelta(seconds=delay_seconds)
+                    retry_at = utc_now_naive() + timedelta(seconds=delay_seconds)
 
                     await conn.execute(
                         """

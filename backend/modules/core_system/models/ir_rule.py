@@ -33,24 +33,6 @@ class IrRule(Model):
 
     active = Field(type_="bool", default=True, label="Activo")
 
-    # =========================================================
-    # Helpers SQL robustos
-    # =========================================================
-
-    @staticmethod
-    async def _fetch(conn_or_pool, query: str, *args):
-        if hasattr(conn_or_pool, "acquire"):
-            async with conn_or_pool.acquire() as conn:
-                return await conn.fetch(query, *args)
-        return await conn_or_pool.fetch(query, *args)
-
-    @staticmethod
-    async def _fetchrow(conn_or_pool, query: str, *args):
-        if hasattr(conn_or_pool, "acquire"):
-            async with conn_or_pool.acquire() as conn:
-                return await conn.fetchrow(query, *args)
-        return await conn_or_pool.fetchrow(query, *args)
-
     @classmethod
     async def _user_group_ids(cls, user_id: Union[int, str]) -> list[int]:
         from app.core.storage.postgres_storage import PostgresGraphStorage
@@ -59,7 +41,7 @@ class IrRule(Model):
             return []
 
         storage = PostgresGraphStorage()
-        conn_or_pool = await storage.get_connection()
+        conn = await storage.get_connection()
         safe_uid = int(user_id)
 
         query = """
@@ -69,19 +51,13 @@ class IrRule(Model):
         """
 
         try:
-            rows = await cls._fetch(conn_or_pool, query, safe_uid)
+            rows = await conn.fetch(query, safe_uid)
             return [int(r["rel_id"]) for r in rows]
         except Exception:
             return []
 
     @classmethod
     async def _is_admin_user(cls, user_id: Union[int, str]) -> bool:
-        """
-        ÚNICA verdad para bypass admin:
-        - user_id == "system"
-        - env.su == True
-        - usuario miembro de res.groups con is_system_admin = TRUE
-        """
         if str(user_id) == "system":
             return True
 
@@ -99,7 +75,7 @@ class IrRule(Model):
         from app.core.storage.postgres_storage import PostgresGraphStorage
 
         storage = PostgresGraphStorage()
-        conn_or_pool = await storage.get_connection()
+        conn = await storage.get_connection()
         safe_uid = int(user_id)
 
         query = """
@@ -113,7 +89,7 @@ class IrRule(Model):
 
         is_admin = False
         try:
-            row = await cls._fetchrow(conn_or_pool, query, safe_uid)
+            row = await conn.fetchrow(query, safe_uid)
             is_admin = bool(row)
         except Exception:
             is_admin = False
@@ -143,14 +119,6 @@ class IrRule(Model):
         user_id: Union[int, str],
         operation: str = "read",
     ) -> list:
-        """
-        Devuelve el dominio RLS combinado para el usuario/operación.
-
-        Reglas:
-        - admin real -> dominio vacío
-        - reglas vacías [] se ignoran
-        - reglas múltiples del mismo modelo se combinan con OR
-        """
         env = Context.get_env()
 
         if await cls._is_admin_user(user_id):

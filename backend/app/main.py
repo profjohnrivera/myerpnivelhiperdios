@@ -19,26 +19,21 @@ from app.api.v1 import auth
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("🚀 [GRANIAN] Iniciando motor HiperDios...")
-
     erp_app = Application()
     await erp_app.boot(discover_modules("modules"))
-
     app.state.erp_app = erp_app
     Model._graph = erp_app.kernel.graph
-
     await PostgresGraphStorage.start_ormcache_listener()
-
     print(f"🧠 [MAIN] Graph Maestro ID: {id(Model._graph)}")
     try:
         nodes_count = len(getattr(Model._graph, "_values", {}))
         print(f"📊 [MAIN] Nodos en memoria: {nodes_count}")
     except Exception:
         pass
-
     try:
         yield
     finally:
-        print("🔌 Apagado.")
+        print("🔌 Apagado...")
         await erp_app.shutdown()
 
 
@@ -49,12 +44,9 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ==============================================================================
-# P0: ELIMINADO session_graph_middleware
-# ------------------------------------------------------------------------------
-# La única vía oficial para contexto aislado por request será:
-#   backend/app/api/v1/runtime.py -> request_env()
-# ==============================================================================
+# La única vía oficial de contexto por request vive en:
+# backend/app/api/v1/runtime.py -> request_env()
+# No reintroducir session_graph_middleware aquí.
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,7 +87,6 @@ async def _ping_database(timeout: float = 2.0) -> dict:
 
 @app.get("/health", tags=["Health"])
 async def health_live():
-    """Liveness: proceso vivo."""
     return {
         "status": "ok",
         "service": "hiperdios-erp",
@@ -110,12 +101,6 @@ async def health_live_alias():
 
 @app.get("/health/ready", tags=["Health"])
 async def health_ready():
-    """
-    Readiness:
-    - graph inicializado
-    - postgres responde
-    - pool operativo
-    """
     checks: dict = {}
 
     checks["graph"] = {
@@ -151,8 +136,5 @@ async def health_ready():
     )
 
 
-# ==============================================================================
-# 🔌 ROUTERS
-# ==============================================================================
 app.include_router(api_router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Auth"])

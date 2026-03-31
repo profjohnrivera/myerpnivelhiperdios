@@ -3,30 +3,42 @@
 async def init_products_menus(env):
     """
     📦 MENÚS DE PRODUCTOS
-    Fuente única de verdad: ir.ui.menu persistido.
+    Idempotentes por XML-ID.
     """
-    Menu = env["ir.ui.menu"]
+    loader = env.data
 
-    cat_products = await Menu.create({
-        "name": "PRODUCTOS",
-        "icon": "Package",
-        "sequence": 15,
-        "is_category": True,
-        "action": "product.product",
-    })
+    cat_products = await loader.ensure_menu(
+        "menu_products_root",
+        {
+            "name": "PRODUCTOS",
+            "icon": "Package",
+            "sequence": 15,
+            "is_category": True,
+            "action": "product.product",
+        },
+        lookup_domain=[("name", "=", "PRODUCTOS"), ("is_category", "=", True)],
+    )
 
-    await Menu.create({
-        "name": "Catálogo",
-        "parent_id": cat_products.id,
-        "action": "product.product",
-        "sequence": 1,
-        "icon": "PackageSearch",
-    })
+    await loader.ensure_menu(
+        "menu_products_catalog",
+        {
+            "name": "Catálogo",
+            "parent_id": cat_products.id,
+            "action": "product.product",
+            "sequence": 1,
+            "icon": "PackageSearch",
+        },
+        lookup_domain=[("name", "=", "Catálogo"), ("parent_id", "=", cat_products.id)],
+    )
 
-    await Menu.create({
-        "name": "Categorías",
-        "parent_id": cat_products.id,
-        "action": "product.category",
-        "sequence": 2,
-        "icon": "Tags",
-    })
+    await loader.ensure_menu(
+        "menu_products_categories",
+        {
+            "name": "Categorías",
+            "parent_id": cat_products.id,
+            "action": "product.category",
+            "sequence": 2,
+            "icon": "Tags",
+        },
+        lookup_domain=[("name", "=", "Categorías"), ("parent_id", "=", cat_products.id)],
+    )

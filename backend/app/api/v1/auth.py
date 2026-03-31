@@ -9,6 +9,7 @@
 #   - Login exitoso → resetea el contador
 #   - Respuesta genérica (no revela si el usuario existe)
 # ============================================================
+
 import json
 import datetime
 from datetime import timedelta, timezone
@@ -33,7 +34,7 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-async def _get_user_row(conn_or_pool, username: str):
+async def _get_user_row(conn, username: str):
     query = """
         SELECT id, login, password, active, company_id, name, partner_id, x_ext
         FROM "res_users"
@@ -41,11 +42,7 @@ async def _get_user_row(conn_or_pool, username: str):
         LIMIT 1
     """
     try:
-        if hasattr(conn_or_pool, "acquire"):
-            async with conn_or_pool.acquire() as conn:
-                row = await conn.fetchrow(query, username)
-        else:
-            row = await conn_or_pool.fetchrow(query, username)
+        row = await conn.fetchrow(query, username)
     except Exception:
         return None
 
@@ -65,7 +62,7 @@ async def _get_user_row(conn_or_pool, username: str):
     return user_data
 
 
-async def _update_counters(conn_or_pool, user_id: int, success: bool):
+async def _update_counters(conn, user_id: int, success: bool):
     if success:
         sql = """
             UPDATE "res_users"
@@ -74,26 +71,17 @@ async def _update_counters(conn_or_pool, user_id: int, success: bool):
             WHERE id = $1
         """
         try:
-            if hasattr(conn_or_pool, "acquire"):
-                async with conn_or_pool.acquire() as conn:
-                    await conn.execute(sql, user_id)
-            else:
-                await conn_or_pool.execute(sql, user_id)
+            await conn.execute(sql, user_id)
         except Exception:
             pass
         return
 
-    # Fallido: obtener contador actual e incrementar
     check_sql = """
         SELECT COALESCE((x_ext->>'failed_login_count')::int, 0) AS count
         FROM "res_users" WHERE id = $1
     """
     try:
-        if hasattr(conn_or_pool, "acquire"):
-            async with conn_or_pool.acquire() as conn:
-                row = await conn.fetchrow(check_sql, user_id)
-        else:
-            row = await conn_or_pool.fetchrow(check_sql, user_id)
+        row = await conn.fetchrow(check_sql, user_id)
         current_count = row["count"] if row else 0
     except Exception:
         current_count = 0
@@ -115,11 +103,7 @@ async def _update_counters(conn_or_pool, user_id: int, success: bool):
         WHERE id = $1
     """
     try:
-        if hasattr(conn_or_pool, "acquire"):
-            async with conn_or_pool.acquire() as conn:
-                await conn.execute(update_sql, user_id, new_ext)
-        else:
-            await conn_or_pool.execute(update_sql, user_id, new_ext)
+        await conn.execute(update_sql, user_id, new_ext)
     except Exception as e:
         print(f"⚠️ [AUTH] Error actualizando contadores: {e}")
 
@@ -162,32 +146,29 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         raise _WRONG
 
     storage = PostgresGraphStorage()
-    conn_or_pool = await storage.get_connection()
+    conn = await storage.get_connection()
 
-    user_data = await _get_user_row(conn_or_pool, username)
+    user_data = await _get_user_row(conn, username)
     if not user_data:
         raise _WRONG
 
     user_id = user_data["id"]
 
-    # Verificar bloqueo
     _check_blocked(user_data)
 
     hashed_password = user_data.get("password") or ""
     if not hashed_password:
-        await _update_counters(conn_or_pool, user_id, success=False)
+        await _update_counters(conn, user_id, success=False)
         raise _WRONG
 
     if not await verify_password(password, hashed_password):
-        await _update_counters(conn_or_pool, user_id, success=False)
-        # Re-leer para ver si el último intento activó el bloqueo
-        refreshed = await _get_user_row(conn_or_pool, username)
+        await _update_counters(conn, user_id, success=False)
+        refreshed = await _get_user_row(conn, username)
         if refreshed:
             _check_blocked(refreshed)
         raise _WRONG
 
-    # Éxito: resetear contadores
-    await _update_counters(conn_or_pool, user_id, success=True)
+    await _update_counters(conn, user_id, success=True)
 
     display_name = user_data.get("name") or user_data.get("login") or "Usuario"
 

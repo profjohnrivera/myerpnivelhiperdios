@@ -12,7 +12,7 @@ from app.core.event_bus import EventBus
 
 from .fields import ComputedField, One2manyField
 from .savepoint import AsyncGraphSavepoint
-
+from app.core.clock import utc_now_iso
 
 class Recordset:
     def __init__(self, model_class: Type, records: List[Any], env: Optional[Env] = None):
@@ -156,31 +156,23 @@ class Recordset:
         await self._check_acl(operation)
         await self._check_row_rules(operation)
 
-    @staticmethod
-    def _is_pool(conn_or_pool) -> bool:
-        return hasattr(conn_or_pool, "acquire")
+    # =========================================================================
+    # HELPERS INTERNOS DE LECTURA
+    # =========================================================================
 
     async def _fetch(self, query: str, *args):
         from app.core.storage.postgres_storage import PostgresGraphStorage
 
         storage = PostgresGraphStorage()
-        conn_or_pool = await storage.get_connection()
-
-        if self._is_pool(conn_or_pool):
-            async with conn_or_pool.acquire() as conn:
-                return await conn.fetch(query, *args)
-        return await conn_or_pool.fetch(query, *args)
+        conn = await storage.get_connection()
+        return await conn.fetch(query, *args)
 
     async def _fetchrow(self, query: str, *args):
         from app.core.storage.postgres_storage import PostgresGraphStorage
 
         storage = PostgresGraphStorage()
-        conn_or_pool = await storage.get_connection()
-
-        if self._is_pool(conn_or_pool):
-            async with conn_or_pool.acquire() as conn:
-                return await conn.fetchrow(query, *args)
-        return await conn_or_pool.fetchrow(query, *args)
+        conn = await storage.get_connection()
+        return await conn.fetchrow(query, *args)
 
     @staticmethod
     def _row_to_dict(storage, row) -> Dict[str, Any]:
@@ -679,26 +671,26 @@ class Recordset:
                 )
                 db_versions = {row["id"]: row["write_version"] for row in rows}
 
-                _is_system_write = (
-                    env is None
-                    or getattr(env, "su", False)
-                    or str(getattr(env, "user_id", "")) == "system"
-                    or str(getattr(env, "uid", "")) == "system"
+                skip_optimistic_lock = bool(
+                    env and getattr(env, "context", {}).get("skip_optimistic_lock", False)
                 )
-                if not _is_system_write:
-                    for rec in self._records:
-                        if str(rec.id).isdigit():
-                            db_version = db_versions.get(int(rec.id))
-                            base_version = (
-                                frontend_version
-                                if frontend_version is not None
-                                else getattr(rec, "write_version", 1)
-                            )
 
-                            if db_version is not None and db_version > int(base_version):
-                                raise ValueError(
-                                    f"⚠️ [CONCURRENCY_CONFLICT] El registro {model_name}({rec.id}) ha sido modificado por otro usuario. Por favor, recarga la página."
-                                )
+                if not skip_optimistic_lock:
+                    for rec in self._records:
+                        if not str(rec.id).isdigit():
+                            continue
+
+                        db_version = db_versions.get(int(rec.id))
+                        base_version = (
+                            frontend_version
+                            if frontend_version is not None
+                            else getattr(rec, "write_version", 1)
+                        )
+
+                        if db_version is not None and db_version > int(base_version):
+                            raise ValueError(
+                                f"⚠️ [CONCURRENCY_CONFLICT] El registro {model_name}({rec.id}) ha sido modificado por otro usuario. Por favor, recarga la página."
+                            )
 
             o2m_data = {}
             for key in list(vals.keys()):
@@ -706,7 +698,7 @@ class Recordset:
                 if isinstance(attr, One2manyField):
                     o2m_data[key] = (attr, vals.pop(key))
 
-            now = datetime.datetime.utcnow().isoformat()
+            now = utc_now_iso()
             uid = env.uid if env else "system"
 
             for rec in self._records:
@@ -759,7 +751,8 @@ class Recordset:
                                         processed_ids.add(int(line_id))
                                 else:
                                     new_child = await ChildModel.create(line_vals, context=rec.graph)
-                                    processed_ids.add(new_child.id)
+                                    if str(new_child.id).isdigit():
+                                        processed_ids.add(int(new_child.id))
 
                             elif isinstance(line, int) or (isinstance(line, str) and str(line).isdigit()):
                                 line_int = int(line)

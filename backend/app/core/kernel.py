@@ -13,6 +13,8 @@ from app.core.graph import Graph
 from app.core.orm import Model
 from app.core.registry import Registry
 from app.core.worker import WorkerEngine
+from app.core.data_loader import ModuleDataLoader
+from app.core.migrations import MigrationRunner
 
 
 class Kernel:
@@ -21,8 +23,8 @@ class Kernel:
 
     REGLA OFICIAL:
     - Kernel es la ÚNICA vía de carga de modules/*/data
-    - Todo init_* corre aquí con Env técnico scoped
-    - El bus oficial viene desde Application
+    - Kernel es la ÚNICA vía de ejecución de migraciones por módulo
+    - Todo init_* corre con Env técnico scoped
     """
 
     def __init__(self, bus: Optional[EventBus] = None, graph: Optional[Graph] = None) -> None:
@@ -37,9 +39,6 @@ class Kernel:
         self._booted = False
 
     def load_modules(self, module_classes: List[Type]) -> None:
-        """
-        Recibe módulos YA ordenados por DAG y NO los reordena.
-        """
         if self.modules:
             return
 
@@ -75,6 +74,9 @@ class Kernel:
 
         print("🛠️ Kernel: Syncing physical schema...")
         await storage.sync_schema()
+
+        print("🧬 Kernel: Running module migrations...")
+        await self._run_module_migrations()
 
         print("🧠 Kernel: Syncing technical metadata...")
         await self._sync_registry_metadata()
@@ -224,6 +226,7 @@ class Kernel:
                 from modules.core_system.models.ir_config_parameter import IrConfigParameter
                 from modules.core_system.models.ir_actions import IrActionsServer, IrActionsActWindow
                 from modules.core_system.models.ir_queue import IrQueue
+                from modules.core_system.models.ir_module_migration import IrModuleMigration
             except Exception as e:
                 raise RuntimeError(f"❌ No se pudieron importar los modelos técnicos de core_system: {e}") from e
 
@@ -242,6 +245,7 @@ class Kernel:
                 "ir.actions.server": IrActionsServer,
                 "ir.actions.act_window": IrActionsActWindow,
                 "ir.queue": IrQueue,
+                "ir.module.migration": IrModuleMigration,
             }
 
             for tech_name, model_cls in core_models.items():
@@ -260,17 +264,29 @@ class Kernel:
         return result
 
     async def _execute_with_system_env(self, func, *args, **kwargs):
-        """
-        Activa un Env técnico temporal scoped y lo restaura al salir.
-        """
         env = Env(
             user_id="system",
             graph=self.graph,
             su=True,
+            context={
+                "disable_audit": True,
+                "skip_optimistic_lock": True,
+            },
             _skip_autoset=True,
         )
         async with env_scope(env):
             return await self._run_maybe_async(func, env, *args, **kwargs)
+
+    async def _run_module_migrations(self) -> None:
+        runner = MigrationRunner()
+
+        async def _runner(env: Env):
+            total = 0
+            for mod_name in self._module_order:
+                total += await runner.run_module(env, mod_name)
+            print(f"   ✅ Migraciones revisadas para {len(self._module_order)} módulos. ({total} archivos inspeccionados)")
+
+        await self._execute_with_system_env(_runner)
 
     async def _execute_init_data(self, module_name: str):
         data_package_path = f"modules.{module_name}.data"
@@ -283,6 +299,8 @@ class Kernel:
             raise RuntimeError(f"❌ Error importando {data_package_path}: {e}") from e
 
         async def _runner(env: Env):
+            env.data = ModuleDataLoader(env, module_name)
+
             if hasattr(data_package, "__path__"):
                 children = sorted(pkgutil.iter_modules(data_package.__path__), key=lambda x: x[1])
                 for _, sub_name, _ in children:

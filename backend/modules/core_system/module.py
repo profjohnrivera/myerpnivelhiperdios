@@ -15,7 +15,7 @@ from modules.core_system.models.ir_model_access import IrModelAccess
 from modules.core_system.models.ir_ui_view import IrUiView
 from modules.core_system.models.ir_config_parameter import IrConfigParameter
 from modules.core_system.models.ir_queue import IrQueue
-
+from modules.core_system.models.ir_module_migration import IrModuleMigration
 
 class CoreSystemModule(Module):
     name = "core_system"
@@ -42,6 +42,7 @@ class CoreSystemModule(Module):
             IrUiView,
             IrConfigParameter,
             IrQueue,
+            IrModuleMigration,
         )
 
     async def boot(self):

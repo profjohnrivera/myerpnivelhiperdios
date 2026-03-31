@@ -52,7 +52,7 @@ class SaleOrder(AbstractDocument, TrazableMixin, AprobableMixin):
         label="Líneas de Pedido",
     )
 
-    # ── Helpers legacy mantenidos como fachada delegada ──────────────────────
+    # ── Helpers fachada ───────────────────────────────────────────────────────
 
     @staticmethod
     def _resolve_company_from_env():
@@ -66,7 +66,7 @@ class SaleOrder(AbstractDocument, TrazableMixin, AprobableMixin):
     def _iter_lines(lines):
         return SaleOrderService.iter_lines(lines)
 
-    async def _get_order_lines(self, allow_db_fallback: bool = False):
+    async def _get_order_lines(self, allow_db_fallback: bool = True):
         return await SaleOrderService.get_order_lines(self, allow_db_fallback=allow_db_fallback)
 
     @staticmethod
@@ -104,7 +104,11 @@ class SaleOrder(AbstractDocument, TrazableMixin, AprobableMixin):
     @classmethod
     async def create(cls, vals, context=None):
         vals = await SaleOrderService.prepare_create_vals(vals)
-        return await super().create(vals, context=context)
+        order = await super().create(vals, context=context)
+
+        # cierre final del agregado, incluso si el create vino con líneas nested
+        await SaleOrderService.compute_total_and_invoice_status(order)
+        return order
 
     async def write(self, vals: Dict[str, Any]) -> bool:
         vals = SaleOrderService.sanitize_write_vals(self, vals)
@@ -112,7 +116,13 @@ class SaleOrder(AbstractDocument, TrazableMixin, AprobableMixin):
         if not vals:
             return True
 
-        return await super().write(vals)
+        result = await super().write(vals)
+
+        # cierre final del agregado cuando cambian líneas o estado
+        if any(k in vals for k in ("order_line", "state")):
+            await SaleOrderService.compute_total_and_invoice_status(self)
+
+        return result
 
     # ── Acciones ─────────────────────────────────────────────────────────────
 

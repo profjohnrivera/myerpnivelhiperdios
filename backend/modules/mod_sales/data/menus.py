@@ -3,22 +3,30 @@
 async def init_sales_menus(env):
     """
     🛒 MENÚS DE VENTAS
-    Solo navegación propia de ventas.
+    Idempotentes por XML-ID.
     """
-    Menu = env["ir.ui.menu"]
+    loader = env.data
 
-    cat_sales = await Menu.create({
-        "name": "VENTAS",
-        "icon": "ShoppingCart",
-        "sequence": 10,
-        "is_category": True,
-        "action": "sale.order",
-    })
+    cat_sales = await loader.ensure_menu(
+        "menu_sales_root",
+        {
+            "name": "VENTAS",
+            "icon": "ShoppingCart",
+            "sequence": 10,
+            "is_category": True,
+            "action": "sale.order",
+        },
+        lookup_domain=[("name", "=", "VENTAS"), ("is_category", "=", True)],
+    )
 
-    await Menu.create({
-        "name": "Pedidos de Venta",
-        "parent_id": cat_sales.id,
-        "action": "sale.order",
-        "sequence": 1,
-        "icon": "FileText",
-    })
+    await loader.ensure_menu(
+        "menu_sales_orders",
+        {
+            "name": "Pedidos de Venta",
+            "parent_id": cat_sales.id,
+            "action": "sale.order",
+            "sequence": 1,
+            "icon": "FileText",
+        },
+        lookup_domain=[("name", "=", "Pedidos de Venta"), ("parent_id", "=", cat_sales.id)],
+    )
