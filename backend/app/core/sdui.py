@@ -329,11 +329,44 @@ class FileUploader(Component):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-
 class ImageUploader(Component):
     def __init__(self, name: str, label: str, readonly: bool = False, **kwargs):
         self.name = name
         self.label = label
+        self.readonly = readonly
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+class HtmlEditor(Component):
+    def __init__(self, name: str, label: str, readonly: bool = False, **kwargs):
+        self.name = name
+        self.label = label
+        self.readonly = readonly
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class JsonEditor(Component):
+    def __init__(self, name: str, label: str, readonly: bool = False, **kwargs):
+        self.name = name
+        self.label = label
+        self.readonly = readonly
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class ReferenceInput(Component):
+    def __init__(
+        self,
+        name: str,
+        label: str,
+        allowed_models: list = None,
+        readonly: bool = False,
+        **kwargs,
+    ):
+        self.name = name
+        self.label = label
+        self.allowed_models = allowed_models or []
         self.readonly = readonly
         for k, v in kwargs.items():
             setattr(self, k, v)

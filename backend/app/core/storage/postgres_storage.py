@@ -170,6 +170,8 @@ class PostgresGraphStorage:
             "password": "VARCHAR(255)",
             "selection": "VARCHAR(255)",
             "text": "TEXT",
+            "html": "TEXT",
+            "reference": "VARCHAR(255)",
             "jsonb": "JSONB",
             "relation": "BIGINT",
             "many2one": "BIGINT",

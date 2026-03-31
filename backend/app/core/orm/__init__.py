@@ -13,6 +13,11 @@ from .fields import (
     One2manyField,
     Many2manyField,
     PasswordField,
+    HtmlField,
+    JsonField,
+    RelatedField,
+    ReferenceField,
+    Many2oneField
 )
 from .decorators import compute, onchange, check_state
 from .recordset import Recordset
@@ -29,6 +34,11 @@ __all__ = [
     "One2manyField",
     "Many2manyField",
     "PasswordField",
+    "HtmlField",
+    "JsonField",
+    "RelatedField",
+    "ReferenceField",
+    "Many2oneField",
     "compute",
     "onchange",
     "check_state",

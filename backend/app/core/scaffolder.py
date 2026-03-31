@@ -12,6 +12,8 @@ class ViewScaffolder:
     TYPE_MAPPING = {
         "string": "TextInput",
         "text": "TextArea",
+        "html": "HtmlEditor",
+        "json": "JsonEditor",
         "decimal": "NumberInput",
         "float": "NumberInput",
         "integer": "NumberInput",
@@ -28,6 +30,7 @@ class ViewScaffolder:
         "password": "TextInput",
         "binary": "FileUploader",
         "image": "ImageUploader",
+        "reference": "ReferenceInput",
     }
 
     HIDDEN_FIELDS = {
@@ -46,6 +49,9 @@ class ViewScaffolder:
     FIELD_COMPONENT_COMPAT = {
         "TextInput": {"string", "text", "password"},
         "TextArea": {"text"},
+        "HtmlEditor": {"html"},
+        "JsonEditor": {"json"},
+        "ReferenceInput": {"reference"},
         "NumberInput": {"integer", "int", "float", "decimal"},
         "MonetaryInput": {"monetary", "float", "decimal"},
         "BooleanSwitch": {"bool"},
@@ -128,6 +134,10 @@ class ViewScaffolder:
         return Registry.get_runtime_fields_for_model(model_name) or {}
 
     @classmethod
+    def _field_type(cls, meta: Dict[str, Any]) -> str:
+        return meta.get("logical_type") or meta.get("type", "string")
+
+    @classmethod
     def _validate_component_field(
         cls,
         *,
@@ -144,7 +154,7 @@ class ViewScaffolder:
             return
 
         meta = fields_meta[field_name]
-        field_type = meta.get("type", "string")
+        field_type = cls._field_type(meta)
         allowed_types = cls.FIELD_COMPONENT_COMPAT.get(component_type)
 
         if allowed_types and field_type not in allowed_types:
@@ -153,13 +163,22 @@ class ViewScaffolder:
                 f"'{model_name}.{field_name}' ({field_type})."
             )
 
-        if component_type in {"Many2OneLookup", "Many2ManyTags"}:
+        if component_type == "Many2OneLookup":
             expected_target = meta.get("target") or meta.get("relation") or meta.get("comodel")
             given_target = props.get("comodel")
             if expected_target and given_target and str(expected_target) != str(given_target):
                 errors.append(
                     f"{path}: comodel inválido para '{model_name}.{field_name}'. "
                     f"Esperado '{expected_target}', recibido '{given_target}'."
+                )
+
+        if component_type == "ReferenceInput":
+            expected_models = meta.get("allowed_models") or []
+            given_models = props.get("allowed_models") or []
+            if expected_models and given_models and list(expected_models) != list(given_models):
+                errors.append(
+                    f"{path}: allowed_models inválido para '{model_name}.{field_name}'. "
+                    f"Esperado {expected_models}, recibido {given_models}."
                 )
 
         if component_type == "One2ManyLines":
@@ -198,7 +217,7 @@ class ViewScaffolder:
                         continue
 
                     cmeta = child_fields[col_field]
-                    ctype = cmeta.get("type", "string")
+                    ctype = cls._field_type(cmeta)
                     allowed_child_types = cls.FIELD_COMPONENT_COMPAT.get(col_type)
                     if allowed_child_types and ctype not in allowed_child_types:
                         errors.append(
@@ -207,7 +226,7 @@ class ViewScaffolder:
                         )
 
                     if col_type == "Many2OneLookup":
-                        expected_child_target = cmeta.get("target") or cmeta.get("relation") or cmeta.get("comodel")
+                        expected_child_target = cmeta.get("comodel") or cmeta.get("target") or cmeta.get("relation")
                         given_child_target = col.get("comodel")
                         if expected_child_target and given_child_target and str(expected_child_target) != str(given_child_target):
                             errors.append(
@@ -239,6 +258,9 @@ class ViewScaffolder:
         if node_type in {
             "TextInput",
             "TextArea",
+            "HtmlEditor",
+            "JsonEditor",
+            "ReferenceInput",
             "NumberInput",
             "MonetaryInput",
             "BooleanSwitch",
@@ -453,7 +475,7 @@ class ViewScaffolder:
                         continue
 
                     meta_dict = f_meta if isinstance(f_meta, dict) else {}
-                    raw_type = meta_dict.get("type", "string")
+                    raw_type = cls._field_type(meta_dict)
 
                     columns.append(
                         {
@@ -651,60 +673,66 @@ class ViewScaffolder:
                 if f_name in cls.HIDDEN_FIELDS:
                     continue
 
-                    meta_dict = f_meta if isinstance(f_meta, dict) else {}
-                    raw_type = meta_dict.get("type", "string")
-                    comp_type = cls.TYPE_MAPPING.get(raw_type, "TextInput")
-                    comodel = meta_dict.get("comodel") or meta_dict.get("target")
+                meta_dict = f_meta if isinstance(f_meta, dict) else {}
+                raw_type = cls._field_type(meta_dict)
+                comp_type = cls.TYPE_MAPPING.get(raw_type, "TextInput")
+                comodel = meta_dict.get("comodel") or meta_dict.get("target")
 
-                    atom_props = {
-                        "name": f_name,
-                        "label": meta_dict.get("label", f_name.title()),
-                        "options": meta_dict.get("options", []),
-                    }
+                atom_props = {
+                    "name": f_name,
+                    "label": meta_dict.get("label", f_name.title()),
+                    "readonly": bool(meta_dict.get("readonly", False)),
+                }
 
-                    if comp_type in ["One2ManyLines", "DataGrid"]:
-                        atom_props["data_source"] = f_name
-                        atom_props["comodel"] = comodel
+                if raw_type == "selection":
+                    atom_props["options"] = meta_dict.get("options", [])
 
-                        inverse = meta_dict.get("inverse_name", "")
-                        atom_props["inverse_name"] = inverse
+                if comp_type == "ReferenceInput":
+                    atom_props["allowed_models"] = meta_dict.get("allowed_models", [])
 
-                        if comodel:
-                            child_fields = cls._get_model_field_map(comodel)
-                            if child_fields:
-                                child_columns = []
-                                for cf_name, cf_meta in child_fields.items():
-                                    if cf_name in cls.HIDDEN_FIELDS or cf_name == inverse:
-                                        continue
+                if comp_type in ["One2ManyLines", "DataGrid"]:
+                    atom_props["data_source"] = f_name
+                    atom_props["comodel"] = comodel
 
-                                    c_meta = cf_meta if isinstance(cf_meta, dict) else {}
-                                    child_type = cls.TYPE_MAPPING.get(c_meta.get("type", "string"), "TextInput")
-                                    child_column = {
-                                        "field": cf_name,
-                                        "label": c_meta.get("label", cf_name.title()),
-                                        "type": child_type,
-                                    }
+                    inverse = meta_dict.get("inverse_name", "")
+                    atom_props["inverse_name"] = inverse
 
-                                    child_target = c_meta.get("comodel") or c_meta.get("target")
-                                    if child_type == "Many2OneLookup" and child_target:
-                                        child_column["comodel"] = child_target
+                    if comodel:
+                        child_fields = cls._get_model_field_map(comodel)
+                        if child_fields:
+                            child_columns = []
+                            for cf_name, cf_meta in child_fields.items():
+                                if cf_name in cls.HIDDEN_FIELDS or cf_name == inverse:
+                                    continue
 
-                                    child_columns.append(child_column)
+                                c_meta = cf_meta if isinstance(cf_meta, dict) else {}
+                                child_type = cls.TYPE_MAPPING.get(cls._field_type(c_meta), "TextInput")
+                                child_column = {
+                                    "field": cf_name,
+                                    "label": c_meta.get("label", cf_name.title()),
+                                    "type": child_type,
+                                }
 
-                                atom_props["columns"] = child_columns
+                                child_target = c_meta.get("comodel") or c_meta.get("target")
+                                if child_type == "Many2OneLookup" and child_target:
+                                    child_column["comodel"] = child_target
 
-                        table_components.append({"type": comp_type, "props": atom_props})
+                                child_columns.append(child_column)
 
-                    elif comp_type == "Many2OneLookup":
-                        atom_props["comodel"] = comodel
-                        generic_fields.append({"type": comp_type, "props": atom_props})
+                            atom_props["columns"] = child_columns
 
-                    elif comp_type == "Many2ManyTags":
-                        atom_props["comodel"] = comodel
-                        generic_fields.append({"type": comp_type, "props": atom_props})
+                    table_components.append({"type": comp_type, "props": atom_props})
 
-                    else:
-                        generic_fields.append({"type": comp_type, "props": atom_props})
+                elif comp_type == "Many2OneLookup":
+                    atom_props["comodel"] = comodel
+                    generic_fields.append({"type": comp_type, "props": atom_props})
+
+                elif comp_type == "Many2ManyTags":
+                    atom_props["comodel"] = comodel
+                    generic_fields.append({"type": comp_type, "props": atom_props})
+
+                else:
+                    generic_fields.append({"type": comp_type, "props": atom_props})
 
             body_children = [
                 {"type": "Group", "props": {}, "children": generic_fields},

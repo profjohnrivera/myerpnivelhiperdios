@@ -1,6 +1,10 @@
 # backend/modules/mod_test/data/menus.py
 
 async def init_test_menus(env):
+    """
+    🧪 MENÚS DEL LABORATORIO
+    Idempotentes por XML-ID.
+    """
     loader = env.data
 
     cat_test = await loader.ensure_menu(
@@ -24,4 +28,16 @@ async def init_test_menus(env):
             "icon": "Database",
         },
         lookup_domain=[("name", "=", "Registros de Prueba"), ("parent_id", "=", cat_test.id)],
+    )
+
+    await loader.ensure_menu(
+        "menu_test_advanced_records",
+        {
+            "name": "Registros Avanzados",
+            "parent_id": cat_test.id,
+            "action": "test.advanced.record",
+            "sequence": 2,
+            "icon": "FlaskConical",
+        },
+        lookup_domain=[("name", "=", "Registros Avanzados"), ("parent_id", "=", cat_test.id)],
     )
